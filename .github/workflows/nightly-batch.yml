@@ -1,0 +1,31 @@
+name: NOIDA夜間バッチ
+
+on:
+  schedule:
+    # 毎日日本時間深夜1時（UTC 16時）に実行
+    - cron: '0 16 * * *'
+  workflow_dispatch: # 手動実行も可能
+
+jobs:
+  nightly-batch:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: リポジトリをチェックアウト
+        uses: actions/checkout@v4
+
+      - name: Node.jsをセットアップ
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 依存関係をインストール
+        run: npm ci
+
+      - name: 夜間バッチを実行
+        env:
+          NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: npx ts-node scripts/nightly-batch.ts
+        

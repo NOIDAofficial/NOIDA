@@ -1,0 +1,201 @@
+'use client'
+
+import { useState, useEffect } from 'react'
+import { supabase } from '@/lib/supabase'
+import { LayoutDashboard, CheckSquare, StickyNote, Briefcase, Users, Calendar, Lightbulb, LogOut } from 'lucide-react'
+
+const NAV_ITEMS = [
+  { value: 'dashboard', label: 'ダッシュボード', icon: LayoutDashboard, color: 'text-[#0071e3]' },
+  { value: 'task', label: 'タスク', icon: CheckSquare, color: 'text-[#34c759]' },
+  { value: 'memo', label: 'メモ', icon: StickyNote, color: 'text-[#ff9f0a]' },
+  { value: 'business', label: 'ビジネス案', icon: Briefcase, color: 'text-[#7c5cbf]' },
+  { value: 'people', label: '人物DB', icon: Users, color: 'text-[#ff3b30]' },
+  { value: 'calendar', label: 'カレンダー', icon: Calendar, color: 'text-[#34c759]' },
+  { value: 'ideas', label: 'アイデア倉庫', icon: Lightbulb, color: 'text-[#ff9f0a]' },
+]
+
+function DashboardHome({ data }: { data: any }) {
+  const today = new Date().toLocaleDateString('ja-JP', { month: 'long', day: 'numeric', weekday: 'short' })
+  const pendingTasks = data.task?.filter((t: any) => !t.done) || []
+  const recentMemos = data.memo?.slice(0, 3) || []
+  const recentIdeas = data.ideas?.slice(0, 3) || []
+
+  return (
+    <div className="space-y-6">
+      {/* 今日のサマリー */}
+      <div className="grid grid-cols-3 gap-4">
+        <div className="bg-white rounded-2xl p-5 border border-[#e8e8ed]">
+          <p className="text-[12px] text-[#aeaeb2] font-medium mb-1">残りタスク</p>
+          <p className="text-[32px] font-bold text-[#1d1d1f]">{pendingTasks.length}</p>
+        </div>
+        <div className="bg-white rounded-2xl p-5 border border-[#e8e8ed]">
+          <p className="text-[12px] text-[#aeaeb2] font-medium mb-1">メモ</p>
+          <p className="text-[32px] font-bold text-[#1d1d1f]">{data.memo?.length || 0}</p>
+        </div>
+        <div className="bg-white rounded-2xl p-5 border border-[#e8e8ed]">
+          <p className="text-[12px] text-[#aeaeb2] font-medium mb-1">アイデア</p>
+          <p className="text-[32px] font-bold text-[#1d1d1f]">{data.ideas?.length || 0}</p>
+        </div>
+      </div>
+
+      {/* 今日のタスク */}
+      <div className="bg-white rounded-2xl p-5 border border-[#e8e8ed]">
+        <h3 className="text-[14px] font-bold text-[#1d1d1f] mb-4">未完了タスク</h3>
+        {pendingTasks.length === 0 ? (
+          <p className="text-[13px] text-[#aeaeb2]">タスクはありません</p>
+        ) : (
+          <div className="space-y-2">
+            {pendingTasks.slice(0, 5).map((t: any) => (
+              <div key={t.id} className="flex items-center gap-3 py-2 border-b border-[#f5f5f7] last:border-0">
+                <div className="w-2 h-2 rounded-full bg-[#0071e3] flex-shrink-0" />
+                <p className="text-[13px] text-[#1d1d1f]">{t.content}</p>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* 最近のメモ */}
+      <div className="bg-white rounded-2xl p-5 border border-[#e8e8ed]">
+        <h3 className="text-[14px] font-bold text-[#1d1d1f] mb-4">最近の保存メモ</h3>
+        {recentMemos.length === 0 ? (
+          <p className="text-[13px] text-[#aeaeb2]">メモはありません</p>
+        ) : (
+          <div className="space-y-2">
+            {recentMemos.map((m: any) => (
+              <div key={m.id} className="py-2 border-b border-[#f5f5f7] last:border-0">
+                <p className="text-[13px] text-[#1d1d1f]">{m.content}</p>
+                <p className="text-[11px] text-[#aeaeb2] mt-1">{new Date(m.created_at).toLocaleDateString('ja-JP')}</p>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function TableView({ items, columns, emptyText }: { items: any[], columns: { key: string, label: string }[], emptyText: string }) {
+  return (
+    <div className="bg-white rounded-2xl border border-[#e8e8ed] overflow-hidden">
+      {items.length === 0 ? (
+        <div className="p-8 text-center text-[13px] text-[#aeaeb2]">{emptyText}</div>
+      ) : (
+        <table className="w-full">
+          <thead>
+            <tr className="border-b border-[#f5f5f7]">
+              {columns.map(col => (
+                <th key={col.key} className="text-left text-[11px] font-semibold text-[#aeaeb2] px-5 py-3 uppercase tracking-wider">
+                  {col.label}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {items.map((item, i) => (
+              <tr key={item.id || i} className="border-b border-[#f5f5f7] last:border-0 hover:bg-[#f5f5f7] transition-colors">
+                {columns.map(col => (
+                  <td key={col.key} className="px-5 py-3 text-[13px] text-[#1d1d1f]">
+                    {col.key === 'done' ? (item[col.key] ? '✅' : '⬜') : String(item[col.key] || '-')}
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </div>
+  )
+}
+
+export default function NoidaDashboard() {
+  const [activeTab, setActiveTab] = useState('dashboard')
+  const [data, setData] = useState<any>({})
+  const [loading, setLoading] = useState(true)
+  const today = new Date().toLocaleDateString('ja-JP', { month: 'short', day: 'numeric' })
+
+  useEffect(() => {
+    async function fetchAll() {
+      setLoading(true)
+      const tables = ['task', 'memo', 'business', 'people', 'calendar', 'ideas']
+      const results: any = {}
+      await Promise.all(tables.map(async (table) => {
+        const { data: rows } = await supabase.from(table).select('*').order('created_at', { ascending: false })
+        results[table] = rows || []
+      }))
+      setData(results)
+      setLoading(false)
+    }
+    fetchAll()
+  }, [activeTab])
+
+  const PAGE_TITLES: Record<string, string> = {
+    dashboard: 'ダッシュボード',
+    task: 'タスク',
+    memo: 'メモ',
+    business: 'ビジネス案',
+    people: '人物DB',
+    calendar: 'カレンダー',
+    ideas: 'アイデア倉庫',
+  }
+
+  return (
+    <div className="flex h-screen overflow-hidden bg-[#f5f5f7]">
+      {/* Sidebar */}
+      <div className="w-60 flex-shrink-0 h-screen sticky top-0 bg-white border-r border-[#e8e8ed] flex flex-col pt-8 pb-6 px-4">
+        <p className="text-[10px] font-semibold uppercase tracking-widest text-[#aeaeb2] px-3 mb-1">NOIDA</p>
+        <h1 className="text-[16px] font-bold text-[#1d1d1f] tracking-tight px-3 mb-6">時間を、渡す。</h1>
+        <nav className="flex-1 space-y-0.5">
+          {NAV_ITEMS.map(item => {
+            const Icon = item.icon
+            const isActive = activeTab === item.value
+            return (
+              <button
+                key={item.value}
+                onClick={() => setActiveTab(item.value)}
+                className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl cursor-pointer transition-all duration-150 ${
+                  isActive ? 'bg-[#f5f5f7] text-[#1d1d1f] font-semibold' : 'text-[#6e6e73] hover:bg-[#f5f5f7] hover:text-[#1d1d1f]'
+                }`}
+              >
+                <Icon className={`w-4 h-4 flex-shrink-0 ${isActive ? item.color : 'text-[#aeaeb2]'}`} strokeWidth={1.8} />
+                <span className="text-[13px] font-medium">{item.label}</span>
+              </button>
+            )
+          })}
+        </nav>
+        <div className="border-t border-[#f5f5f7] pt-4">
+          <div className="flex items-center gap-2 px-3 py-2">
+            <div className="w-2 h-2 rounded-full bg-[#34c759]" />
+            <span className="text-[12px] text-[#6e6e73]">稼働中</span>
+          </div>
+        </div>
+      </div>
+
+      {/* Main */}
+      <div className="flex-1 overflow-y-auto">
+        <div className="p-8">
+          <div className="flex items-center justify-between mb-8">
+            <h2 className="text-[22px] font-bold text-[#1d1d1f] tracking-tight">{PAGE_TITLES[activeTab]}</h2>
+            <span className="text-[12px] text-[#aeaeb2]">{today}</span>
+          </div>
+
+          {loading ? (
+            <div className="flex items-center justify-center h-40">
+              <div className="w-6 h-6 border-2 border-[#0071e3] border-t-transparent rounded-full animate-spin" />
+            </div>
+          ) : (
+            <>
+              {activeTab === 'dashboard' && <DashboardHome data={data} />}
+              {activeTab === 'task' && <TableView items={data.task || []} columns={[{ key: 'done', label: '完了' }, { key: 'content', label: 'タスク' }, { key: 'created_at', label: '作成日' }]} emptyText="タスクはありません" />}
+              {activeTab === 'memo' && <TableView items={data.memo || []} columns={[{ key: 'content', label: 'メモ' }, { key: 'created_at', label: '保存日' }]} emptyText="メモはありません" />}
+              {activeTab === 'business' && <TableView items={data.business || []} columns={[{ key: 'content', label: 'ビジネス案' }, { key: 'created_at', label: '作成日' }]} emptyText="ビジネス案はありません" />}
+              {activeTab === 'people' && <TableView items={data.people || []} columns={[{ key: 'name', label: '名前' }, { key: 'importance', label: '重要度' }, { key: 'note', label: '特記事項' }]} emptyText="人物データはありません" />}
+              {activeTab === 'calendar' && <TableView items={data.calendar || []} columns={[{ key: 'title', label: '予定' }, { key: 'datetime', label: '日時' }]} emptyText="予定はありません" />}
+              {activeTab === 'ideas' && <TableView items={data.ideas || []} columns={[{ key: 'content', label: 'アイデア' }, { key: 'created_at', label: '保存日' }]} emptyText="アイデアはありません" />}
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
