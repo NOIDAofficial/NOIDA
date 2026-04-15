@@ -1,58 +1,57 @@
+'use client'
+
+import { useEffect, useState } from 'react'
 import NoidaIcon from './NoidaIcon'
+import { supabase } from '@/lib/supabase'
 
 export default function NoidaHeader() {
+  const [stats, setStats] = useState({ tasks: 0, memos: 0, done: 0 })
+
+  useEffect(() => {
+    const fetchStats = async () => {
+      const [{ count: tasks }, { count: memos }, { count: done }] = await Promise.all([
+        supabase.from('task').select('*', { count: 'exact', head: true }).eq('done', false),
+        supabase.from('memo').select('*', { count: 'exact', head: true }),
+        supabase.from('task').select('*', { count: 'exact', head: true }).eq('done', true),
+      ])
+      setStats({ tasks: tasks || 0, memos: memos || 0, done: done || 0 })
+    }
+    fetchStats()
+  }, [])
+
   return (
-    <header className="flex-shrink-0" style={{
+    <header style={{
       background: '#0e0e16',
       borderBottom: '0.5px solid rgba(255,255,255,0.07)',
       padding: '18px 20px 14px',
+      flexShrink: 0,
     }}>
-      {/* トップ行 */}
-      <div className="flex items-center justify-between mb-3">
-        <div className="flex items-center gap-3">
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
           <div style={{
-            width: 36,
-            height: 36,
-            borderRadius: '50%',
+            width: 36, height: 36, borderRadius: '50%',
             background: 'rgba(255,255,255,0.05)',
             border: '0.5px solid rgba(255,255,255,0.1)',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
           }}>
             <NoidaIcon size={16} />
           </div>
           <div>
-            <div style={{ fontSize: 14, fontWeight: 500, color: 'rgba(255,255,255,0.88)', letterSpacing: '0.05em' }}>
-              NOIDA
-            </div>
-            <div style={{ fontSize: 10, color: 'rgba(255,255,255,0.25)', marginTop: 1, letterSpacing: '0.04em' }}>
-              時間を、渡す。
-            </div>
+            <div style={{ fontSize: 14, fontWeight: 500, color: 'rgba(255,255,255,0.88)', letterSpacing: '0.05em' }}>NOIDA</div>
+            <div style={{ fontSize: 10, color: 'rgba(255,255,255,0.25)', marginTop: 1, letterSpacing: '0.04em' }}>時間を、渡す。</div>
           </div>
         </div>
-
-        {/* ステータス */}
-        <div className="flex items-center gap-2">
-          <div style={{
-            width: 6,
-            height: 6,
-            borderRadius: '50%',
-            background: '#2d8a4e',
-            animation: 'pulse 2s infinite',
-          }} />
-          <span style={{ fontSize: 10, color: 'rgba(255,255,255,0.28)', letterSpacing: '0.04em' }}>
-            稼働中
-          </span>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <div style={{ width: 6, height: 6, borderRadius: '50%', background: '#2d8a4e', animation: 'pulse 2s infinite' }} />
+          <span style={{ fontSize: 10, color: 'rgba(255,255,255,0.28)', letterSpacing: '0.04em' }}>稼働中</span>
         </div>
       </div>
 
-      {/* サマリー */}
-      <div className="grid grid-cols-3 gap-2">
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 8 }}>
         {[
-          { n: '3', l: '残りタスク' },
-          { n: '12', l: 'メモ' },
-          { n: '8', l: '完了' },
+          { n: stats.tasks, l: '残りタスク' },
+          { n: stats.memos, l: 'メモ' },
+          { n: stats.done, l: '完了' },
         ].map((s) => (
           <div key={s.l} style={{
             background: 'rgba(255,255,255,0.04)',
