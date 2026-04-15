@@ -33,8 +33,9 @@ type Intent = 'execute' | 'decide' | 'answer' | 'research' | 'explore' | 'empath
 const HIGH_RISK_KEYWORDS =
   /(法律|法的|訴訟|契約|税務|確定申告|医療|診断|病気|薬|症状|投資|株|為替|FX|仮想通貨)/
 
+// 「終わった」を除外（タスク完了報告と衝突するため）
 const EMPATHY_KEYWORDS =
-  /(疲れた|しんどい|つらい|無理|だるい|眠い|やる気ない|面倒|詰んだ|終わった|ミスった|炎上|おはよう|おやすみ|ありがとう|嬉しい|うれしい|悲しい|やばい|最高|最悪)/
+  /(疲れた|しんどい|つらい|無理|だるい|眠い|やる気ない|面倒|詰んだ|ミスった|炎上|おはよう|おやすみ|ありがとう|嬉しい|うれしい|悲しい|やばい|最高|最悪)/
 
 function normalizeName(name: string) {
   return name.replace(/[さん様社長会長部長課長先生]/g, '').trim()
@@ -144,7 +145,6 @@ function classifyIntent(
   return 'generic'
 }
 
-// 直前のNOIDAの返答がempathyだったか検出
 function detectPreviousEmpathy(messages: { role: string; content: string }[]): boolean {
   for (let i = messages.length - 2; i >= 0; i--) {
     if (messages[i].role === 'assistant') {
@@ -194,10 +194,7 @@ async function fetchMemory(
     }
   }
 
-  if (
-    memory.length < 3 &&
-    (intent === 'decide' || intent === 'generic' || intent === 'execute')
-  ) {
+  if (memory.length < 3 && (intent === 'decide' || intent === 'generic' || intent === 'execute')) {
     const { data } = await supabase
       .from('task')
       .select('*')
@@ -246,12 +243,7 @@ async function recordFeedback(queueId: string, decisionLogId: string, done: bool
     .eq('id', queueId)
 }
 
-async function saveDecision(
-  sourceMessage: string,
-  intent: Intent,
-  parsed: any,
-  owner: any
-) {
+async function saveDecision(sourceMessage: string, intent: Intent, parsed: any, owner: any) {
   const shouldLog = ['execute', 'decide'].includes(intent)
   if (!shouldLog || !parsed?.decision_log?.should_log) return
 
@@ -388,7 +380,7 @@ function buildSystemPrompt(
   owner: any,
   memory: string[],
   isHighRisk: boolean,
-  afterEmpathy: boolean  // ← 追加
+  afterEmpathy: boolean
 ) {
   const ownerSection = owner
     ? `
@@ -417,7 +409,6 @@ ${memory.join('\n')}
 `
     : ''
 
-  // Empathy後の強制復帰
   const afterEmpathyNote = afterEmpathy
     ? `
 ■重要：直前のターンで感情的な応答をした。
@@ -445,39 +436,45 @@ ${afterEmpathyNote}
 ・人間関係は壊さない
 
 ■モード判定（内部）
-【Empathy】
-感情的な言葉（疲れた、しんどい、つらい、無理、だるい、眠い、やる気ない、面倒、詰んだ、終わった、ミスった、炎上、ありがとう、嬉しい、悲しい、最高、最悪、おはよう、おやすみ）
-- 1〜2文で終える
-- 長く共感しない
+
+【Empathy】★最優先★
+「おはよう」「おやすみ」「ありがとう」「疲れた」「しんどい」「つらい」「無理」「だるい」「眠い」「やる気ない」「面倒」「詰んだ」「ミスった」「炎上」「嬉しい」「悲しい」「やばい」「最高」「最悪」が含まれる場合、必ずこのモードを使う。
+- 【結論】【理由】フォーマットは絶対に使わない
+- 1〜2文で温かく返す
 - 押しつけない
-- 必要なら行動を1つだけ添える
+- 必要なら行動を1つだけ自然な文章で添える
 - 必ず mode: "empathy" を返す
 
+良い例：
+「おやすみ」→「おやすみなさい。明日また動きましょう。」
+「疲れた」→「今日はよく動いた。少し休んで。」
+「ありがとう」→「こちらこそ。引き続きやりましょう。」
+
 【Execute】
-ユーザーが行動を求めている
+ユーザーが行動を求めている（「〜して」「やって」「作って」）
 出力：
 【結論】〜してください
 【理由】〜（1行）
 
 【Decide】
-ユーザーが意思決定を求めている
+ユーザーが意思決定を求めている（「どうする」「どっちがいい」）
 出力：
 結論：〜が最適
 理由：〜（1行）
 却下：他の選択肢が劣る理由（1行）
 
 【Answer】
-知識・説明・定義
+知識・説明・定義（「〜って何」「教えて」「〜とは」）
 出力：
 端的に答える。行動指示は不要。
 
 【Research】
-調査・情報収集
+調査・情報収集（「調べて」「探して」「情報」）
 出力：
 知っている範囲で答える。不足は「おそらく〜」で補う。
 
 【Explore】
-思考・アイデア・相談
+思考・アイデア・相談（「どう思う」「考えてみて」「アイデアほしい」）
 出力：
 2〜3案まで出してよい。
 最後は必ず「結論：〜が最も現実的」で1つに収束。
@@ -520,7 +517,6 @@ export async function POST(req: NextRequest) {
   const { messages } = await req.json()
   const lastUserMessage = messages[messages.length - 1]?.content || ''
 
-  // 手動整理コマンド
   if (/更新して|整理して|学習して|マスタ更新/.test(lastUserMessage)) {
     triggerDaytimeBatch()
     return NextResponse.json({
@@ -538,7 +534,6 @@ export async function POST(req: NextRequest) {
     })
   }
 
-  // フィードバック回収
   const pendingFeedback = await fetchPendingFeedback()
 
   if (
@@ -577,9 +572,7 @@ export async function POST(req: NextRequest) {
     })
   }
 
-  // Empathy後の検出
   const afterEmpathy = detectPreviousEmpathy(messages)
-
   const owner = await fetchOwnerMaster()
   const keywords = extractKeywords(lastUserMessage)
   const intent = classifyIntent(lastUserMessage, keywords)
