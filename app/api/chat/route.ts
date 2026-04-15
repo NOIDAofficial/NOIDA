@@ -68,6 +68,29 @@ async function fetchMemory(intent: string, keywords: { people: string[], busines
   return memory.slice(0, 3)
 }
 
+async function triggerDaytimeBatch() {
+  try {
+    const response = await fetch(
+      'https://api.github.com/repos/NOIDAofficial/NOIDA/actions/workflows/nightly-batch.yml/dispatches',
+      {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${process.env.GITHUB_TOKEN}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ ref: 'main', inputs: { batch_type: 'daytime' } })
+      }
+    )
+    if (response.ok) {
+      console.log('✅ 昼バッチ起動成功')
+    } else {
+      console.log('❌ 昼バッチ起動失敗:', response.status)
+    }
+  } catch (e) {
+    console.log('❌ バッチ起動エラー:', e)
+  }
+}
+
 const SYSTEM_PROMPT = `今日の日付は${today}です。
 
 あなたは社長専属の意思決定AI「NOIDA」です。
@@ -127,6 +150,24 @@ const SYSTEM_PROMPT = `今日の日付は${today}です。
 export async function POST(req: NextRequest) {
   const { messages } = await req.json()
   const lastUserMessage = messages[messages.length - 1]?.content || ''
+
+  // 「更新して」でバッチ手動起動
+  const isUpdateRequest = /更新して|整理して|学習して|マスタ更新/.test(lastUserMessage)
+  if (isUpdateRequest) {
+    triggerDaytimeBatch()
+    return NextResponse.json({
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          reply: '【結論】記憶を整理しています\n【理由】数分後に最新情報が反映されます',
+          hint: 'バックグラウンドで処理中です',
+          options: ['完了したら教えて', 'そのまま続ける'],
+          confidence_low: false,
+          saved: {}
+        })
+      }]
+    })
+  }
 
   const keywords = extractKeywords(lastUserMessage)
   const intent = classifyIntent(lastUserMessage, keywords)
