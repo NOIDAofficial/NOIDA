@@ -1,31 +1,49 @@
-name: NOIDA夜間バッチ
+name: NOIDAバッチ
 
 on:
   schedule:
-    - cron: '0 16 * * *'
+    - cron: '0 0 * * *'   # JST 9時（昼バッチ）
+    - cron: '0 4 * * *'   # JST 13時（昼バッチ）
+    - cron: '0 9 * * *'   # JST 18時（昼バッチ）
+    - cron: '0 20 * * *'  # JST 朝5時（朝バッチ）
   workflow_dispatch:
+    inputs:
+      batch_type:
+        description: 'バッチタイプ（daytime or nightly）'
+        required: false
+        default: 'daytime'
 
 jobs:
-  nightly-batch:
+  daytime-batch:
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.batch_type == 'daytime' || github.event_name == 'schedule' && (github.event.schedule == '0 0 * * *' || github.event.schedule == '0 4 * * *' || github.event.schedule == '0 9 * * *')
     runs-on: ubuntu-latest
-
     steps:
-      - name: リポジトリをチェックアウト
-        uses: actions/checkout@v4
-
-      - name: Node.jsをセットアップ
-        uses: actions/setup-node@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: '20'
           cache: 'npm'
+      - run: npm install
+      - name: 昼バッチを実行
+        env:
+          NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: npx tsx scripts/daytime-batch.ts
 
-      - name: 依存関係をインストール
-        run: npm install
-
-      - name: 夜間バッチを実行
+  nightly-batch:
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.batch_type == 'nightly' || github.event_name == 'schedule' && github.event.schedule == '0 20 * * *'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm install
+      - name: 朝バッチを実行
         env:
           NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: npx tsx scripts/nightly-batch.ts
-        

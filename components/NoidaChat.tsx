@@ -3,6 +3,7 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
 import { Message, Option } from '@/lib/types'
 import NoidaIcon from './NoidaIcon'
+import { supabase } from '@/lib/supabase'
 
 function now() {
   const d = new Date()
@@ -13,27 +14,101 @@ function uid() {
   return Math.random().toString(36).slice(2)
 }
 
-const INITIAL_MESSAGES: Message[] = [
-  {
-    id: uid(),
-    role: 'noida',
-    content: 'おはようございます。今日はAIAIMARTのUI修正が最優先です。先に終わらせると今週リリースに間に合います。',
-    hint: '田中商事からメールあり。後で処理します。',
-    options: [
-      { num: '01', text: 'AIAIMARTから着手する' },
-      { num: '02', text: '全タスクを確認する' },
-      { num: '03', text: '新しいタスクを追加' },
-    ],
-    timestamp: now(),
-  },
-]
+function todayString() {
+  const d = new Date()
+  return `${d.getMonth() + 1}月${d.getDate()}日`
+}
 
 export default function NoidaChat() {
-  const [messages, setMessages] = useState<Message[]>(INITIAL_MESSAGES)
+  const [messages, setMessages] = useState<Message[]>([])
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
+  const [initialLoading, setInitialLoading] = useState(true)
   const chatRef = useRef<HTMLDivElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
+
+  // 朝のブリーフィングを取得
+  useEffect(() => {
+    const fetchBriefing = async () => {
+      try {
+        // 今日のブリーフィングをmemoから取得
+        const today = new Date()
+        today.setHours(0, 0, 0, 0)
+
+        const { data: briefing } = await supabase
+          .from('memo')
+          .select('*')
+          .like('title', '%ブリーフィング%')
+          .gte('created_at', today.toISOString())
+          .order('created_at', { ascending: false })
+          .limit(1)
+          .single()
+
+        // オーナー情報を取得
+        const { data: owner } = await supabase
+          .from('owner_master')
+          .select('name')
+          .limit(1)
+          .single()
+
+        const ownerName = owner?.name ? `${owner.name}さん` : 'おはようございます'
+
+        if (briefing?.content) {
+          setMessages([{
+            id: uid(),
+            role: 'noida',
+            content: briefing.content,
+            hint: '今日も最高の判断を。',
+            options: [
+              { num: '01', text: '今日のタスクを確認する' },
+              { num: '02', text: '新しい指示を出す' },
+              { num: '03', text: '昨日の振り返り' },
+            ],
+            timestamp: now(),
+          }])
+        } else {
+          // ブリーフィングがない場合はデフォルトメッセージ
+          const { data: tasks } = await supabase
+            .from('task')
+            .select('*')
+            .eq('done', false)
+            .order('created_at', { ascending: false })
+            .limit(1)
+
+          const topTask = tasks?.[0]?.content
+
+          setMessages([{
+            id: uid(),
+            role: 'noida',
+            content: topTask
+              ? `${ownerName}。今日は「${topTask}」が最優先です。`
+              : `${ownerName}。今日も判断を任せてください。`,
+            hint: '話しかけるだけで動きます。',
+            options: [
+              { num: '01', text: '今日のタスクを確認する' },
+              { num: '02', text: '新しい指示を出す' },
+              { num: '03', text: '重要な人を確認する' },
+            ],
+            timestamp: now(),
+          }])
+        }
+      } catch {
+        setMessages([{
+          id: uid(),
+          role: 'noida',
+          content: 'おはようございます。今日も判断を任せてください。',
+          options: [
+            { num: '01', text: '今日のタスクを確認する' },
+            { num: '02', text: '新しい指示を出す' },
+          ],
+          timestamp: now(),
+        }])
+      }
+      setInitialLoading(false)
+    }
+
+    fetchBriefing()
+  }, [])
 
   useEffect(() => {
     chatRef.current?.scrollTo({ top: chatRef.current.scrollHeight, behavior: 'smooth' })
@@ -121,7 +196,6 @@ savedは今の会話で重要な情報を記録。省略OK。`
     if (textareaRef.current) {
       textareaRef.current.style.height = 'auto'
     }
-    // 選択肢を消す
     setMessages(prev => prev.map(m => ({ ...m, options: undefined })))
     addMessage({ role: 'user', content: msg })
     await callClaude(msg, messages)
@@ -144,24 +218,37 @@ savedは今の会話で重要な情報を記録。省略OK。`
     e.target.style.height = Math.min(e.target.scrollHeight, 100) + 'px'
   }
 
+  if (initialLoading) {
+    return (
+      <div className="flex flex-col flex-1 overflow-hidden items-center justify-center" style={{ background: '#0e0e16' }}>
+        <div style={{ display: 'flex', gap: 5, alignItems: 'center' }}>
+          {[0, 1, 2].map(i => (
+            <div key={i} style={{
+              width: 5, height: 5, borderRadius: '50%',
+              background: 'rgba(255,255,255,0.35)',
+              animation: `bounce 0.9s ${i * 0.15}s infinite`,
+            }} />
+          ))}
+        </div>
+      </div>
+    )
+  }
+
   return (
     <div className="flex flex-col flex-1 overflow-hidden" style={{ background: '#0e0e16' }}>
-
-      {/* チャットエリア */}
       <div
         ref={chatRef}
         className="flex-1 overflow-y-auto flex flex-col gap-3"
         style={{ padding: '16px' }}
       >
         <div style={{ textAlign: 'center', fontSize: 10, color: 'rgba(255,255,255,0.2)', letterSpacing: '0.06em' }}>
-          今日 · 4月14日
+          今日 · {todayString()}
         </div>
 
         {messages.map((msg) => (
           <div key={msg.id}>
             {msg.role === 'noida' ? (
               <div className="flex gap-2 items-end">
-                {/* アバター */}
                 <div style={{
                   width: 24, height: 24, borderRadius: '50%',
                   background: 'rgba(255,255,255,0.05)',
@@ -173,7 +260,6 @@ savedは今の会話で重要な情報を記録。省略OK。`
                 </div>
 
                 <div style={{ maxWidth: '82%' }}>
-                  {/* 吹き出し */}
                   <div style={{
                     background: 'rgba(255,255,255,0.05)',
                     border: '0.5px solid rgba(255,255,255,0.09)',
@@ -184,7 +270,6 @@ savedは今の会話で重要な情報を記録。省略OK。`
                       {msg.content}
                     </p>
 
-                    {/* 保存通知 */}
                     {msg.saved && (
                       <div style={{
                         marginTop: 8,
@@ -198,7 +283,6 @@ savedは今の会話で重要な情報を記録。省略OK。`
                       </div>
                     )}
 
-                    {/* ヒント */}
                     {msg.hint && (
                       <div style={{
                         marginTop: 8,
@@ -217,7 +301,6 @@ savedは今の会話で重要な情報を記録。省略OK。`
                     </div>
                   </div>
 
-                  {/* 選択肢（JARVIS形式） */}
                   {msg.options && msg.options.length > 0 && (
                     <div className="flex flex-col gap-1 mt-2">
                       {msg.options.map((opt) => (
@@ -280,7 +363,6 @@ savedは今の会話で重要な情報を記録。省略OK。`
           </div>
         ))}
 
-        {/* タイピング */}
         {loading && (
           <div className="flex gap-2 items-end">
             <div style={{
@@ -302,21 +384,17 @@ savedは今の会話で重要な情報を記録。省略OK。`
               alignItems: 'center',
             }}>
               {[0, 1, 2].map(i => (
-                <div
-                  key={i}
-                  style={{
-                    width: 5, height: 5, borderRadius: '50%',
-                    background: 'rgba(255,255,255,0.35)',
-                    animation: `bounce 0.9s ${i * 0.15}s infinite`,
-                  }}
-                />
+                <div key={i} style={{
+                  width: 5, height: 5, borderRadius: '50%',
+                  background: 'rgba(255,255,255,0.35)',
+                  animation: `bounce 0.9s ${i * 0.15}s infinite`,
+                }} />
               ))}
             </div>
           </div>
         )}
       </div>
 
-      {/* 入力エリア */}
       <div style={{
         padding: '10px 16px 16px',
         borderTop: '0.5px solid rgba(255,255,255,0.07)',
