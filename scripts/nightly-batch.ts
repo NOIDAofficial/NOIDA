@@ -10,9 +10,15 @@ const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY!,
 })
 
+const NOIDA_MODELS = {
+  REALTIME: 'gpt-4o-mini',
+  ANALYTICS: 'gpt-4o',
+  AUDIT: 'claude-sonnet-4-5',
+  EXTRACTOR: 'gpt-4o-mini',
+}
+
 const DECAY_RATE = 0.99
 
-// ① confidence time decay
 async function applyTimeDecay() {
   console.log('📉 confidence time decay適用')
   const { data: master } = await supabase
@@ -38,7 +44,6 @@ async function applyTimeDecay() {
   console.log('✅ time decay完了')
 }
 
-// ② 逆学習：reverse_feedbackを処理
 async function processReverseFeedback() {
   console.log('🔄 逆学習処理開始')
 
@@ -67,13 +72,15 @@ async function processReverseFeedback() {
   if (!feedbackText) return
 
   const response = await openai.chat.completions.create({
-    model: 'gpt-4o-mini',
+    model: NOIDA_MODELS.ANALYTICS,
     max_tokens: 1000,
     messages: [
       {
         role: 'system',
         content: `あなたはNOIDAの学習エンジンです。
 ユーザーの「本当はこうしたかった」という回答から、判断パターンを分析してください。
+これはNOIDAの人格の根幹を形成する重要な処理です。
+将来的にClaudeやGeminiなど複数のAIがNOIDAの判断を補助する際の「NOIDAの憲法」として扱える形式で出力してください。
 必ずJSON形式のみで返答してください。
 
 {
@@ -101,13 +108,12 @@ async function processReverseFeedback() {
     return
   }
 
-  // owner_master_draftsに保存（直接更新しない）
   if (parsed.failure_patterns?.length > 0) {
     await supabase.from('owner_master_drafts').insert({
       field_name: 'failure_patterns',
       before_value: { value: owner?.failure_patterns },
       proposed_value: { value: parsed.failure_patterns.join('\n') },
-      confidence: parsed.confidence_delta || 0.05,
+      confidence: Math.min(parsed.confidence_delta || 0.05, 0.1),
       evidence_count: feedbacks.length,
       reason: '逆学習：してない回答の分析',
       status: 'pending'
@@ -119,20 +125,18 @@ async function processReverseFeedback() {
       field_name: 'rejection_patterns',
       before_value: { value: owner?.rejection_patterns },
       proposed_value: { value: parsed.rejection_patterns.join('\n') },
-      confidence: parsed.confidence_delta || 0.05,
+      confidence: Math.min(parsed.confidence_delta || 0.05, 0.1),
       evidence_count: feedbacks.length,
       reason: '逆学習：拒否パターン抽出',
       status: 'pending'
     })
   }
 
-  // 処理済みにマーク
   const ids = feedbacks.map(f => f.id)
   await supabase.from('reverse_feedback').update({ processed: true }).in('id', ids)
   console.log(`✅ ${ids.length}件の逆学習処理完了`)
 }
 
-// ③ owner_master自動成長分析
 async function analyzeOwnerGrowth() {
   console.log('🧠 owner_master成長分析開始')
 
@@ -156,13 +160,16 @@ async function analyzeOwnerGrowth() {
   const winRate = doneCount / recentDecisions.length
 
   const response = await openai.chat.completions.create({
-    model: 'gpt-4o-mini',
+    model: NOIDA_MODELS.ANALYTICS,
     max_tokens: 1000,
     messages: [
       {
         role: 'system',
         content: `あなたはNOIDAの人格分析エンジンです。
 判断ログからowner_masterの更新候補を生成してください。
+重要：あなたは人格を直接書き換えるのではなく、高精度な「下書き（draft）」を生成する役割です。
+最終的な人格反映はNOIDA側のconfidence/time decay/承認フローで制御されます。
+将来的にClaudeやGeminiなど複数のAIがNOIDAを補助する際の「NOIDAの憲法」として扱える形式で出力してください。
 必ずJSON形式のみで返答してください。
 
 {
@@ -195,11 +202,12 @@ async function analyzeOwnerGrowth() {
     return
   }
 
-  // draftsをowner_master_draftsに保存
   if (parsed.drafts?.length > 0) {
     for (const draft of parsed.drafts) {
       const currentConfidence = (owner?.confidence_by_field as any)?.[draft.field] || 0.5
-      const newConfidence = Math.min(1, currentConfidence + (draft.confidence_delta || 0.05))
+      const rawDelta = draft.confidence_delta || 0.05
+      const safeDelta = Math.min(rawDelta, 0.1)
+      const newConfidence = Math.min(1, currentConfidence + safeDelta)
 
       await supabase.from('owner_master_drafts').insert({
         field_name: draft.field,
@@ -214,7 +222,6 @@ async function analyzeOwnerGrowth() {
     console.log(`✅ ${parsed.drafts.length}件の更新候補を生成`)
   }
 
-  // briefing_queueに追加
   const today = new Date().toISOString().split('T')[0]
   await supabase.from('briefing_queue').upsert({
     briefing_date: today,
@@ -226,7 +233,6 @@ async function analyzeOwnerGrowth() {
   console.log('✅ 成長分析完了')
 }
 
-// 既存関数（変更なし）
 async function analyzeTalkMaster() {
   console.log('🔍 talk_master分析開始')
 
@@ -252,7 +258,7 @@ async function analyzeTalkMaster() {
     .join('\n')
 
   const response = await openai.chat.completions.create({
-    model: 'gpt-4o-mini',
+    model: NOIDA_MODELS.EXTRACTOR,
     max_tokens: 2000,
     messages: [
       {
@@ -376,13 +382,14 @@ async function generateBriefing() {
     : ''
 
   const response = await openai.chat.completions.create({
-    model: 'gpt-4o-mini',
+    model: NOIDA_MODELS.ANALYTICS,
     max_tokens: 500,
     messages: [
       {
         role: 'system',
         content: `あなたは社長専属の意思決定AI「NOIDA」です。
-明日の最優先行動を1つだけ提示してください。
+これはNOIDAの全機能の中で最も価値が高いアウトプットです。
+全情報を統合し、社長の背中を押す「今日やるべき1つ」を生成してください。
 必ずJSON形式のみで返答してください。
 
 {
