@@ -12,7 +12,7 @@ import { createClient } from '@supabase/supabase-js'
  * 1. tenantIdを全操作の軸に追加（認証整備後）
  * 2. Supabase client責務分離（anon key → service role）
  * 3. Monitorモード実装（decision_log安定後）
- * 4. フロント側で「した/してない」UIを実装
+ * 4. フロント側で「した/してない」UIを実装 ✅完了
  * 5. people同姓同名・転職の完全照合対応
  * 6. ログインボーナス制・研修期間モデルの実装
  */
@@ -33,7 +33,6 @@ type Intent = 'execute' | 'decide' | 'answer' | 'research' | 'explore' | 'empath
 const HIGH_RISK_KEYWORDS =
   /(法律|法的|訴訟|契約|税務|確定申告|医療|診断|病気|薬|症状|投資|株|為替|FX|仮想通貨)/
 
-// 「終わった」を除外（タスク完了報告と衝突するため）
 const EMPATHY_KEYWORDS =
   /(疲れた|しんどい|つらい|無理|だるい|眠い|やる気ない|面倒|詰んだ|ミスった|炎上|おはよう|おやすみ|ありがとう|嬉しい|うれしい|悲しい|やばい|最高|最悪)/
 
@@ -87,7 +86,7 @@ function extractDatetime(text: string): { title: string; datetime: string | null
     {
       regex: /今週[のは]?\s*(月|火|水|木|金|土|日)曜/,
       resolver: (m) => {
-        const dayMap: Record<string, number> = { 月: 1, 火: 2, 水: 3, 木: 4, 金: 5, 土: 6, 日: 0 }
+        const dayMap: Record<string, number> = {月: 1, 火: 2, 水: 3, 木: 4, 金: 5, 土: 6, 日: 0 }
         const target = dayMap[m[1]]
         const d = new Date(now)
         const diff = (target - d.getDay() + 7) % 7
@@ -145,18 +144,22 @@ function classifyIntent(
   return 'generic'
 }
 
-function detectPreviousEmpathy(messages: { role: string; content: string }[]): boolean {
-  for (let i = messages.length - 2; i >= 0; i--) {
-    if (messages[i].role === 'assistant') {
-      try {
-        const parsed = JSON.parse(messages[i].content)
-        return parsed.mode === 'empathy'
-      } catch {
-        return false
-      }
-    }
+function detectPreviousEmpathy(messages: any[]): boolean {
+  const lastAssistant = [...messages].reverse().find(m => m.role === 'assistant')
+  if (!lastAssistant) return false
+
+  // フロントから送られたmetaを優先チェック
+  if (lastAssistant.meta?.mode === 'empathy') return true
+
+  // バックアップ：contentをパースしてチェック
+  try {
+    const content = lastAssistant.content
+    const jsonStr = content.substring(content.indexOf('{'), content.lastIndexOf('}') + 1)
+    const parsed = JSON.parse(jsonStr)
+    return parsed.mode === 'empathy'
+  } catch {
+    return false
   }
-  return false
 }
 
 async function fetchOwnerMaster() {
@@ -390,6 +393,7 @@ function buildSystemPrompt(
 文体: ${owner.writing_style || ''}
 現在の主要課題: ${owner.key_issues || ''}
 避けたいこと: ${owner.avoid_patterns || ''}
+現在のフォーカス: ${owner.current_focus || ''}
 `
     : ''
 
@@ -580,6 +584,9 @@ export async function POST(req: NextRequest) {
   const isHighRisk = HIGH_RISK_KEYWORDS.test(lastUserMessage)
   const systemPrompt = buildSystemPrompt(owner, memory, isHighRisk, afterEmpathy)
 
+  // metaフィールドを除外してOpenAIに渡す
+  const cleanMessages = messages.map(({ meta, ...rest }: any) => rest)
+
   const res = await fetch('https://api.openai.com/v1/chat/completions', {
     method: 'POST',
     headers: {
@@ -590,7 +597,7 @@ export async function POST(req: NextRequest) {
       model: 'gpt-4o-mini',
       temperature: 0.2,
       max_tokens: 1000,
-      messages: [{ role: 'system', content: systemPrompt }, ...messages],
+      messages: [{ role: 'system', content: systemPrompt }, ...cleanMessages],
     }),
   })
 
@@ -644,3 +651,4 @@ export async function POST(req: NextRequest) {
     }],
   })
 }
+

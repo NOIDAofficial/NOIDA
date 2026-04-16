@@ -10,6 +10,7 @@ export interface Message {
   role: Role
   content: string
   hint?: string
+  mode?: string
   options?: Option[]
   timestamp: string
   saved?: string
