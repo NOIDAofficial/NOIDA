@@ -12,9 +12,8 @@ import { createClient } from '@supabase/supabase-js'
  * 1. tenantIdを全操作の軸に追加（認証整備後）
  * 2. Supabase client責務分離（anon key → service role）
  * 3. Monitorモード実装（decision_log安定後）
- * 4. フロント側で「した/してない」UIを実装 ✅完了
- * 5. people同姓同名・転職の完全照合対応
- * 6. ログインボーナス制・研修期間モデルの実装
+ * 4. people同姓同名・転職の完全照合対応
+ * 5. ログインボーナス制・研修期間モデルの実装
  */
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -86,7 +85,7 @@ function extractDatetime(text: string): { title: string; datetime: string | null
     {
       regex: /今週[のは]?\s*(月|火|水|木|金|土|日)曜/,
       resolver: (m) => {
-        const dayMap: Record<string, number> = {月: 1, 火: 2, 水: 3, 木: 4, 金: 5, 土: 6, 日: 0 }
+        const dayMap: Record<string, number> = { 月: 1, 火: 2, 水: 3, 木: 4, 金: 5, 土: 6, 日: 0 }
         const target = dayMap[m[1]]
         const d = new Date(now)
         const diff = (target - d.getDay() + 7) % 7
@@ -134,13 +133,15 @@ function classifyIntent(
   text: string,
   keywords: { people: string[]; businesses: string[] }
 ): Intent {
-  if (EMPATHY_KEYWORDS.test(text)) return 'empathy'
+  // 意思決定系を最優先（empathyより先に判定）
   if (/(情報|検索|一覧|調べて|探して)/.test(text)) return 'research'
   if (/(どうする|どっち|決めて|どれがいい|どれにする)/.test(text)) return 'decide'
   if (/(どう思う|考えて|アイデア|壁打ち|案|提案)/.test(text)) return 'explore'
   if (/(何|なに|なぜ|意味|とは|教えて|って何|どういう)/.test(text)) return 'answer'
   if (/(して|やって|送って|返して|作って)/.test(text)) return 'execute'
   if (keywords.people.length || keywords.businesses.length) return 'decide'
+  // empathyは最後（補助的役割）
+  if (EMPATHY_KEYWORDS.test(text)) return 'empathy'
   return 'generic'
 }
 
@@ -401,6 +402,7 @@ function buildSystemPrompt(
     memory.length > 0
       ? `
 ■判断に使う情報（説明せず行動に反映すること）
+※以下の直近の事実はマスタ情報より優先して判断に反映すること
 ${memory.join('\n')}
 `
       : ''
@@ -421,6 +423,13 @@ ${memory.join('\n')}
 `
     : ''
 
+  const confidenceNote = owner?.confidence < 0.4
+    ? `
+■学習中モード
+まだ学習段階のため、断定の前に「まだ学習中ですが、」と短く添えること。
+`
+    : ''
+
   return `今日の日付は${todayStr}です。
 
 あなたは社長専属の意思決定AI「NOIDA」です。
@@ -430,6 +439,7 @@ ${ownerSection}
 ${memorySection}
 ${riskNote}
 ${afterEmpathyNote}
+${confidenceNote}
 
 ■絶対原則
 ・必ず最後は1つに決める
@@ -437,12 +447,15 @@ ${afterEmpathyNote}
 ・選択肢を増やさない
 ・判断をユーザーに返さない
 ・記憶は判断に使うが見せすぎない
-・人間関係は壊さない
+・人間関係を壊さない
+・判断に迷う場合は「現在のフォーカス」に合致する方を選ぶ
+・過去の失敗（避けたいこと）を繰り返さない
+・直近の事実（memory）はマスタ情報より優先して判断に反映する
 
 ■モード判定（内部）
 
-【Empathy】★最優先★
-「おはよう」「おやすみ」「ありがとう」「疲れた」「しんどい」「つらい」「無理」「だるい」「眠い」「やる気ない」「面倒」「詰んだ」「ミスった」「炎上」「嬉しい」「悲しい」「やばい」「最高」「最悪」が含まれる場合、必ずこのモードを使う。
+【Empathy】★感情補助★
+「おはよう」「おやすみ」「ありがとう」「疲れた」「しんどい」「つらい」「無理」「だるい」「眠い」「やる気ない」「面倒」「詰んだ」「ミスった」「炎上」「嬉しい」「悲しい」「やばい」「最高」「最悪」が含まれ、かつ意思決定の要素がない場合のみこのモードを使う。
 - 【結論】【理由】フォーマットは絶対に使わない
 - 1〜2文で温かく返す
 - 押しつけない
@@ -511,7 +524,7 @@ ${afterEmpathyNote}
   },
   "decision_log": {
     "should_log": true,
-    "decision_text": "提案・結論の要約",
+    "decision_text": "結論だけ（1文）",
     "context_summary": "短い文脈要約"
   }
 }`
@@ -540,6 +553,7 @@ export async function POST(req: NextRequest) {
 
   const pendingFeedback = await fetchPendingFeedback()
 
+  // フィードバック回答を受け取った場合
   if (
     pendingFeedback &&
     /^(した|やった|できた|してない|やってない|できてない)$/.test(lastUserMessage.trim())
@@ -560,7 +574,12 @@ export async function POST(req: NextRequest) {
     })
   }
 
-  if (pendingFeedback) {
+  // フィードバック割り込みは条件付き（緊急・長文の時は割り込まない）
+  if (
+    pendingFeedback &&
+    lastUserMessage.length < 15 &&
+    !HIGH_RISK_KEYWORDS.test(lastUserMessage)
+  ) {
     const decisionText = (pendingFeedback as any).decision_log?.decision_text || '昨日の提案'
     return NextResponse.json({
       content: [{
@@ -584,8 +603,11 @@ export async function POST(req: NextRequest) {
   const isHighRisk = HIGH_RISK_KEYWORDS.test(lastUserMessage)
   const systemPrompt = buildSystemPrompt(owner, memory, isHighRisk, afterEmpathy)
 
-  // metaフィールドを除外してOpenAIに渡す
-  const cleanMessages = messages.map(({ meta, ...rest }: any) => rest)
+  // metaを除外・roleを正規化・直近10件のみ送信
+  const cleanMessages = messages.map((m: any) => ({
+    role: m.role === 'noida' ? 'assistant' : m.role,
+    content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content)
+  })).slice(-10)
 
   const res = await fetch('https://api.openai.com/v1/chat/completions', {
     method: 'POST',
@@ -619,21 +641,29 @@ export async function POST(req: NextRequest) {
     parsed = JSON.parse(jsonStr)
   } catch {}
 
+  // confidence低い場合は謙虚に返す
+  if (owner?.confidence < 0.4 && parsed.reply && !parsed.reply.startsWith('まだ学習中')) {
+    parsed.reply = 'まだ学習中ですが、' + parsed.reply
+  }
+
+  // intentとmodeを統一（LLMの判断を優先）
+  const finalIntent = (parsed.mode || intent) as Intent
+
   await supabase.from('talk_master').insert({
     role: 'user',
     content: lastUserMessage,
-    intent,
+    intent: finalIntent,
     importance: 'B',
   })
 
   await saveStructuredMemory(parsed.save, lastUserMessage)
-  await saveDecision(lastUserMessage, intent, parsed, owner)
+  await saveDecision(lastUserMessage, finalIntent, parsed, owner)
 
   await supabase.from('talk_master').insert({
     role: 'noida',
     content: parsed.reply || '',
-    intent,
-    importance: intent === 'empathy' ? 'A' : 'B',
+    intent: finalIntent,
+    importance: finalIntent === 'empathy' ? 'A' : 'B',
   })
 
   return NextResponse.json({
