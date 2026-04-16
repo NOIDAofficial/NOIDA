@@ -10,6 +10,13 @@ const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY!,
 })
 
+const NOIDA_MODELS = {
+  REALTIME: 'gpt-4o-mini',
+  ANALYTICS: 'gpt-4o',
+  AUDIT: 'claude-sonnet-4-5',
+  EXTRACTOR: 'gpt-4o-mini',
+}
+
 async function keepAlive() {
   console.log('💓 非アクティブ防止クエリ実行')
   const tables = ['people', 'task', 'memo', 'calendar', 'business_master', 'talk_master', 'owner_master']
@@ -44,7 +51,7 @@ async function analyzeTalkMaster() {
     .join('\n')
 
   const response = await openai.chat.completions.create({
-    model: 'gpt-4o-mini',
+    model: NOIDA_MODELS.EXTRACTOR,
     max_tokens: 1000,
     messages: [
       {
@@ -76,7 +83,6 @@ async function analyzeTalkMaster() {
     return
   }
 
-  // 人物情報を昇格
   if (parsed.people?.length > 0) {
     for (const person of parsed.people) {
       if (!person.name) continue
@@ -91,7 +97,6 @@ async function analyzeTalkMaster() {
     }
   }
 
-  // タスクを昇格
   if (parsed.tasks?.length > 0) {
     for (const task of parsed.tasks) {
       if (!task.content) continue
@@ -103,7 +108,6 @@ async function analyzeTalkMaster() {
     }
   }
 
-  // 予定を昇格
   if (parsed.calendar?.length > 0) {
     for (const event of parsed.calendar) {
       if (!event.title) continue
@@ -112,7 +116,6 @@ async function analyzeTalkMaster() {
     }
   }
 
-  // 事業情報を昇格
   if (parsed.business?.length > 0) {
     for (const biz of parsed.business) {
       if (!biz.name) continue
@@ -126,7 +129,6 @@ async function analyzeTalkMaster() {
     }
   }
 
-  // メモを昇格
   if (parsed.memo?.length > 0) {
     for (const m of parsed.memo) {
       if (!m.content) continue
@@ -135,7 +137,6 @@ async function analyzeTalkMaster() {
     }
   }
 
-  // 昇格済みにマーク
   const talkIds = talks.map(t => t.id)
   const deleteAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString()
   await supabase.from('talk_master').update({ promoted: true, delete_at: deleteAt }).in('id', talkIds)
