@@ -1,5 +1,6 @@
 import { createClient } from '@supabase/supabase-js'
 import OpenAI from 'openai'
+import crypto from 'crypto'
 
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -18,6 +19,13 @@ const NOIDA_MODELS = {
 }
 
 const DECAY_RATE = 0.99
+
+// ハッシュ連鎖用の計算関数
+function calculateHash(content: string, prevHash: string | null): string {
+  const hash = crypto.createHash('sha256')
+  hash.update((prevHash || '') + content)
+  return hash.digest('hex')
+}
 
 async function applyTimeDecay() {
   console.log('📉 confidence time decay適用')
@@ -66,7 +74,7 @@ async function processReverseFeedback() {
 
   const feedbackText = feedbacks
     .filter(f => f.preferred_action)
-    .map(f => `提案：${(f.decision_log as any)?.decision_text || ''}\n本当はどうしたかった：${f.preferred_action}`)
+    .map(f => `提案: ${(f.decision_log as any)?.decision_text || ''}\n本当はどうしたかった: ${f.preferred_action}`)
     .join('\n\n')
 
   if (!feedbackText) return
@@ -80,7 +88,6 @@ async function processReverseFeedback() {
         content: `あなたはNOIDAの学習エンジンです。
 ユーザーの「本当はこうしたかった」という回答から、判断パターンを分析してください。
 これはNOIDAの人格の根幹を形成する重要な処理です。
-将来的にClaudeやGeminiなど複数のAIがNOIDAの判断を補助する際の「NOIDAの憲法」として扱える形式で出力してください。
 必ずJSON形式のみで返答してください。
 
 {
@@ -115,7 +122,7 @@ async function processReverseFeedback() {
       proposed_value: { value: parsed.failure_patterns.join('\n') },
       confidence: Math.min(parsed.confidence_delta || 0.05, 0.1),
       evidence_count: feedbacks.length,
-      reason: '逆学習：してない回答の分析',
+      reason: '逆学習: してない回答の分析',
       status: 'pending'
     })
   }
@@ -127,7 +134,7 @@ async function processReverseFeedback() {
       proposed_value: { value: parsed.rejection_patterns.join('\n') },
       confidence: Math.min(parsed.confidence_delta || 0.05, 0.1),
       evidence_count: feedbacks.length,
-      reason: '逆学習：拒否パターン抽出',
+      reason: '逆学習: 拒否パターン抽出',
       status: 'pending'
     })
   }
@@ -153,7 +160,10 @@ async function analyzeOwnerGrowth() {
     .order('created_at', { ascending: false })
     .limit(30)
 
-  if (!recentDecisions || recentDecisions.length === 0) return
+  if (!recentDecisions || recentDecisions.length === 0) {
+    console.log('📭 分析対象の decision_log なし')
+    return
+  }
 
   const doneCount = recentDecisions.filter(d => d.action_taken === 'done').length
   const skippedCount = recentDecisions.filter(d => d.action_taken === 'skipped').length
@@ -167,9 +177,7 @@ async function analyzeOwnerGrowth() {
         role: 'system',
         content: `あなたはNOIDAの人格分析エンジンです。
 判断ログからowner_masterの更新候補を生成してください。
-重要：あなたは人格を直接書き換えるのではなく、高精度な「下書き（draft）」を生成する役割です。
-最終的な人格反映はNOIDA側のconfidence/time decay/承認フローで制御されます。
-将来的にClaudeやGeminiなど複数のAIがNOIDAを補助する際の「NOIDAの憲法」として扱える形式で出力してください。
+あなたは人格を直接書き換えるのではなく、「下書き(draft)」を生成する役割です。
 必ずJSON形式のみで返答してください。
 
 {
@@ -233,18 +241,187 @@ async function analyzeOwnerGrowth() {
   console.log('✅ 成長分析完了')
 }
 
+/**
+ * ★新規: archiveDailyLog
+ * 昨日のtalk_masterを daily_log + daily_log_entries にアーカイブ
+ * ハッシュ連鎖で改ざん検知可能にする
+ */
+async function archiveDailyLog() {
+  console.log('📚 1日分のログをアーカイブ開始')
+
+  const yesterday = new Date()
+  yesterday.setDate(yesterday.getDate() - 1)
+  const yesterdayStr = yesterday.toISOString().split('T')[0]
+
+  const { data: talks } = await supabase
+    .from('talk_master')
+    .select('*')
+    .eq('session_date', yesterdayStr)
+    .order('created_at', { ascending: true })
+
+  if (!talks || talks.length === 0) {
+    console.log('📭 アーカイブ対象の会話なし')
+    return
+  }
+
+  console.log(`📝 ${talks.length}件の会話をアーカイブ`)
+
+  const { data: existing } = await supabase
+    .from('daily_log')
+    .select('id')
+    .eq('session_date', yesterdayStr)
+    .maybeSingle()
+
+  if (existing) {
+    console.log('⚠️ 既にアーカイブ済み、スキップ')
+    return
+  }
+
+  const conversationText = talks
+    .map((t, i) => `[${i + 1}][${t.role}] ${t.content}`)
+    .join('\n')
+
+  const response = await openai.chat.completions.create({
+    model: NOIDA_MODELS.ANALYTICS,
+    max_tokens: 1500,
+    messages: [
+      {
+        role: 'system',
+        content: `あなたはNOIDAの記憶アーキテクトです。
+1日分の会話ログを分析し、以下を抽出してください。
+必ずJSON形式のみで返答してください。
+
+{
+  "summary": "その日1日を3〜5行で要約",
+  "topics": ["話したトピック1", "トピック2"],
+  "key_decisions": ["この日の主要判断1", "判断2"],
+  "emotional_tone": "positive / neutral / stressed / reflective のいずれか"
+}`
+      },
+      {
+        role: 'user',
+        content: `以下は${yesterdayStr}の会話ログです:\n\n${conversationText}`
+      }
+    ]
+  })
+
+  const text = response.choices[0]?.message?.content || ''
+  let summary: any = {
+    summary: '',
+    topics: [],
+    key_decisions: [],
+    emotional_tone: 'neutral'
+  }
+
+  try {
+    const jsonStr = text.substring(text.indexOf('{'), text.lastIndexOf('}') + 1)
+    summary = JSON.parse(jsonStr)
+  } catch {
+    console.log('❌ 要約JSON解析失敗、スキップ')
+    return
+  }
+
+  const { data: owner } = await supabase
+    .from('owner_master')
+    .select('id, last_hash, daily_log_hashes')
+    .limit(1)
+    .single()
+
+  const prevHash = owner?.last_hash || null
+
+  const hashContent = JSON.stringify({
+    session_date: yesterdayStr,
+    summary: summary.summary,
+    topics: summary.topics,
+    key_decisions: summary.key_decisions,
+    talks: talks.map(t => ({
+      role: t.role,
+      content: t.content,
+      created_at: t.created_at
+    }))
+  })
+
+  const contentHash = calculateHash(hashContent, prevHash)
+
+  const { data: dailyLog, error: dailyLogError } = await supabase
+    .from('daily_log')
+    .insert({
+      session_date: yesterdayStr,
+      summary: summary.summary,
+      topics: summary.topics || [],
+      key_decisions: summary.key_decisions || [],
+      emotional_tone: summary.emotional_tone || 'neutral',
+      entry_count: talks.length,
+      content_hash: contentHash,
+      prev_hash: prevHash,
+      archived: true,
+    })
+    .select('id')
+    .single()
+
+  if (dailyLogError || !dailyLog) {
+    console.log('❌ daily_log INSERT失敗:', dailyLogError)
+    return
+  }
+
+  const entries = talks.map((t, i) => ({
+    daily_log_id: dailyLog.id,
+    session_date: yesterdayStr,
+    sequence: i + 1,
+    role: t.role,
+    content: t.content,
+    intent: t.intent,
+    importance: t.importance,
+    original_talk_id: t.id,
+    created_at: t.created_at,
+  }))
+
+  const { error: entriesError } = await supabase
+    .from('daily_log_entries')
+    .insert(entries)
+
+  if (entriesError) {
+    console.log('❌ daily_log_entries INSERT失敗:', entriesError)
+    return
+  }
+
+  const prevHashes = Array.isArray(owner?.daily_log_hashes) 
+    ? owner.daily_log_hashes 
+    : []
+  const newHashes = [
+    ...prevHashes,
+    { date: yesterdayStr, hash: contentHash, prev_hash: prevHash }
+  ].slice(-365)
+
+  if (owner?.id) {
+    await supabase
+      .from('owner_master')
+      .update({
+        last_hash: contentHash,
+        daily_log_hashes: newHashes,
+      })
+      .eq('id', owner.id)
+  }
+
+  await supabase
+    .from('talk_master')
+    .delete()
+    .eq('session_date', yesterdayStr)
+
+  console.log(`✅ ${yesterdayStr} のログをアーカイブ完了 (hash: ${contentHash.substring(0, 8)}...)`)
+}
+
 async function analyzeTalkMaster() {
   console.log('🔍 talk_master分析開始')
 
   const { data: talks } = await supabase
     .from('talk_master')
     .select('*')
-    .eq('promoted', false)
-    .gte('created_at', new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString())
+    .gte('created_at', new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString())
     .order('created_at', { ascending: true })
 
   if (!talks || talks.length === 0) {
-    console.log('📭 未昇格の会話なし')
+    console.log('📭 分析対象の会話なし')
     return
   }
 
@@ -272,13 +449,12 @@ async function analyzeTalkMaster() {
   "tasks": [{"content": ""}],
   "calendar": [{"title": "", "datetime": ""}],
   "business": [{"name": "", "note": ""}],
-  "memo": [{"content": ""}],
-  "delete_ids": []
+  "memo": [{"content": ""}]
 }`
       },
       {
         role: 'user',
-        content: `以下の会話ログを分析してください：\n\n${conversationText}\n\n会話ID一覧：\n${userTalks.map(t => `${t.id}: ${t.content.substring(0, 50)}`).join('\n')}`
+        content: `以下の会話ログを分析してください:\n\n${conversationText}`
       }
     ]
   })
@@ -304,7 +480,6 @@ async function analyzeTalkMaster() {
       } else {
         await supabase.from('people').insert({ name: person.name, company: person.company, position: person.position, importance: person.importance || 'B', note: person.note })
       }
-      console.log(`👤 人物更新: ${person.name}`)
     }
   }
 
@@ -314,7 +489,6 @@ async function analyzeTalkMaster() {
       const { data: existing } = await supabase.from('task').select('id').eq('content', task.content).single()
       if (!existing) {
         await supabase.from('task').insert({ content: task.content, done: false })
-        console.log(`✅ タスク追加: ${task.content}`)
       }
     }
   }
@@ -323,7 +497,6 @@ async function analyzeTalkMaster() {
     for (const event of parsed.calendar) {
       if (!event.title) continue
       await supabase.from('calendar').insert({ title: event.title, datetime: event.datetime ? new Date(event.datetime) : null })
-      console.log(`📅 予定追加: ${event.title}`)
     }
   }
 
@@ -336,7 +509,6 @@ async function analyzeTalkMaster() {
       } else {
         await supabase.from('business_master').insert({ name: biz.name, note: biz.note, status: '進行中' })
       }
-      console.log(`💼 事業更新: ${biz.name}`)
     }
   }
 
@@ -344,25 +516,15 @@ async function analyzeTalkMaster() {
     for (const m of parsed.memo) {
       if (!m.content) continue
       await supabase.from('memo').insert({ content: m.content, color: 'yellow' })
-      console.log(`📝 メモ追加: ${m.content.substring(0, 30)}`)
     }
   }
 
-  const talkIds = talks.map(t => t.id)
-  const deleteAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString()
-  await supabase.from('talk_master').update({ promoted: true, delete_at: deleteAt }).in('id', talkIds)
-  console.log(`✅ ${talkIds.length}件を昇格済みにマーク`)
-}
-
-async function deleteStaleTalks() {
-  console.log('🗑️ 期限切れ会話を削除')
-  await supabase.from('talk_master').delete().eq('promoted', true).lt('delete_at', new Date().toISOString())
-  console.log('✅ 削除完了')
+  console.log('✅ talk_master分析完了')
 }
 
 async function keepAlive() {
   console.log('💓 非アクティブ防止クエリ実行')
-  const tables = ['people', 'task', 'memo', 'calendar', 'business_master', 'talk_master', 'owner_master']
+  const tables = ['people', 'task', 'memo', 'calendar', 'business_master', 'talk_master', 'owner_master', 'daily_log', 'daily_log_entries']
   for (const table of tables) {
     await supabase.from(table).select('id').limit(1)
   }
@@ -388,21 +550,20 @@ async function generateBriefing() {
       {
         role: 'system',
         content: `あなたは社長専属の意思決定AI「NOIDA」です。
-これはNOIDAの全機能の中で最も価値が高いアウトプットです。
 全情報を統合し、社長の背中を押す「今日やるべき1つ」を生成してください。
 必ずJSON形式のみで返答してください。
 
 {
   "top_action": "【結論】○○してください\n【理由】○○だから",
-  "summary": "今日の整理まとめ（1〜2行）",
-  "growth_note": "昨日より成長した点（省略可）"
+  "summary": "今日の整理まとめ(1〜2行)",
+  "growth_note": "昨日より成長した点(省略可)"
 }`
       },
       {
         role: 'user',
-        content: `オーナー：${owner?.name || ''}
-未完了タスク：${tasks?.map(t => t.content).join('、') || 'なし'}
-直近の予定：${calendar?.map(c => c.title).join('、') || 'なし'}${draftSummary}
+        content: `オーナー: ${owner?.name || ''}
+未完了タスク: ${tasks?.map(t => t.content).join('、') || 'なし'}
+直近の予定: ${calendar?.map(c => c.title).join('、') || 'なし'}${draftSummary}
 
 明日の最優先行動を1つ教えてください。`
       }
@@ -422,9 +583,6 @@ async function generateBriefing() {
     }, { onConflict: 'briefing_date' })
 
     console.log('✅ ブリーフィング保存完了')
-    if (briefing.growth_note) {
-      console.log(`🌱 成長メモ: ${briefing.growth_note}`)
-    }
   } catch {
     console.log('❌ ブリーフィング生成失敗')
   }
@@ -437,10 +595,9 @@ async function main() {
   await processReverseFeedback()
   await analyzeOwnerGrowth()
   await analyzeTalkMaster()
-  await deleteStaleTalks()
+  await archiveDailyLog()
   await generateBriefing()
   console.log('✅ 朝バッチ完了:', new Date().toLocaleString('ja-JP'))
 }
 
 main().catch(console.error)
-
