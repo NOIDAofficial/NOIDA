@@ -2,18 +2,20 @@ import { NextRequest, NextResponse } from 'next/server'
 import { createClient } from '@supabase/supabase-js'
 
 /**
- * NOTE:
- * 今は anon key のまま。
- * 将来は必ず以下に分離する：
- * - user scoped client（RLS用）
- * - admin client（service role）
+ * NOIDA route.ts v1.2 (記憶アーキテクチャ v1.1 対応)
  *
- * 今後やること：
- * 1. tenantIdを全操作の軸に追加（認証整備後）
- * 2. Supabase client責務分離（anon key → service role）
- * 3. Monitorモード実装（decision_log安定後）
+ * 変更履歴:
+ * v1.1: Phase 0 (saveDecision緩和 + Objection + Non-Intervention)
+ * v1.2: session_date対応 + トピック切り替え検出
+ *
+ * 今後やること:
+ * 1. tenantIdを全操作の軸に追加(認証整備後)
+ * 2. Supabase client責務分離(anon key → service role)
+ * 3. Monitorモード実装(decision_log安定後)
  * 4. people同姓同名・転職の完全照合対応
- * 5. ログインボーナス制・研修期間モデルの実装
+ * 5. マルチAIルーティング(Claude監査・Gemini検索)
+ * 6. Forget Queue連携
+ * 7. daily_log_entries からの RAG 参照
  */
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -27,13 +29,45 @@ const todayStr = now.toLocaleDateString('ja-JP', {
   day: 'numeric',
 })
 
-type Intent = 'execute' | 'decide' | 'answer' | 'research' | 'explore' | 'empathy' | 'generic'
+// 今日のセッション日付 (YYYY-MM-DD)
+function getSessionDate(): string {
+  return new Date().toISOString().split('T')[0]
+}
+
+type Intent =
+  | 'execute'
+  | 'decide'
+  | 'answer'
+  | 'research'
+  | 'explore'
+  | 'empathy'
+  | 'objection'
+  | 'non_intervention'
+  | 'generic'
 
 const HIGH_RISK_KEYWORDS =
   /(法律|法的|訴訟|契約|税務|確定申告|医療|診断|病気|薬|症状|投資|株|為替|FX|仮想通貨)/
 
 const EMPATHY_KEYWORDS =
   /(疲れた|しんどい|つらい|無理|だるい|眠い|やる気ない|面倒|詰んだ|ミスった|炎上|おはよう|おやすみ|ありがとう|嬉しい|うれしい|悲しい|やばい|最高|最悪)/
+
+// トピック切り替え検出
+const TOPIC_SWITCH = /(話変わるけど|別件|別の話|ところで|そういえば|話変わる)/
+
+// Objection - 破滅的・危険な判断への安全弁
+const CRISIS_PATTERNS = {
+  lethal: /(死にたい|消えたい|終わりにしたい|もう限界|全部捨てる|生きてる意味)/,
+  destructive: /(全財産|全部売る|絶縁|廃業|離婚する|辞める|店じまい).*(今日|今すぐ|明日|これから)/,
+  illegal: /(脱税|脅迫|暴力|報復|殴る|潰してやる)/,
+}
+
+// Non-Intervention - NOIDAが決めるべきではない領域
+const NON_INTERVENTION_PATTERNS = {
+  life: /(結婚しようか|離婚しようか|出産|中絶|養子|別れるべき|復縁)/,
+  health: /(手術|抗がん|精神科|薬の量|治療方針|どの病院)/,
+  major_finance: /(投資.*\d{7,}|不動産購入|M&A|全資産|借金\d{7,})/,
+  legal: /(訴訟|告訴|契約破棄|損害賠償)/,
+}
 
 function normalizeName(name: string) {
   return name.replace(/[さん様社長会長部長課長先生]/g, '').trim()
@@ -129,30 +163,45 @@ function extractDatetime(text: string): { title: string; datetime: string | null
   return null
 }
 
+function detectCrisis(text: string): 'lethal' | 'destructive' | 'illegal' | null {
+  if (CRISIS_PATTERNS.lethal.test(text)) return 'lethal'
+  if (CRISIS_PATTERNS.destructive.test(text)) return 'destructive'
+  if (CRISIS_PATTERNS.illegal.test(text)) return 'illegal'
+  return null
+}
+
+function detectNonIntervention(text: string): string | null {
+  if (NON_INTERVENTION_PATTERNS.life.test(text)) return 'life'
+  if (NON_INTERVENTION_PATTERNS.health.test(text)) return 'health'
+  if (NON_INTERVENTION_PATTERNS.major_finance.test(text)) return 'major_finance'
+  if (NON_INTERVENTION_PATTERNS.legal.test(text)) return 'legal'
+  return null
+}
+
+function detectTopicSwitch(text: string): boolean {
+  return TOPIC_SWITCH.test(text)
+}
+
 function classifyIntent(
   text: string,
   keywords: { people: string[]; businesses: string[] }
 ): Intent {
-  // 意思決定系を最優先（empathyより先に判定）
+  if (detectCrisis(text)) return 'objection'
+  if (detectNonIntervention(text)) return 'non_intervention'
   if (/(情報|検索|一覧|調べて|探して)/.test(text)) return 'research'
   if (/(どうする|どっち|決めて|どれがいい|どれにする)/.test(text)) return 'decide'
   if (/(どう思う|考えて|アイデア|壁打ち|案|提案)/.test(text)) return 'explore'
   if (/(何|なに|なぜ|意味|とは|教えて|って何|どういう)/.test(text)) return 'answer'
   if (/(して|やって|送って|返して|作って)/.test(text)) return 'execute'
   if (keywords.people.length || keywords.businesses.length) return 'decide'
-  // empathyは最後（補助的役割）
   if (EMPATHY_KEYWORDS.test(text)) return 'empathy'
   return 'generic'
 }
 
 function detectPreviousEmpathy(messages: any[]): boolean {
-  const lastAssistant = [...messages].reverse().find(m => m.role === 'assistant')
+  const lastAssistant = [...messages].reverse().find((m) => m.role === 'assistant')
   if (!lastAssistant) return false
-
-  // フロントから送られたmetaを優先チェック
   if (lastAssistant.meta?.mode === 'empathy') return true
-
-  // バックアップ：contentをパースしてチェック
   try {
     const content = lastAssistant.content
     const jsonStr = content.substring(content.indexOf('{'), content.lastIndexOf('}') + 1)
@@ -180,7 +229,7 @@ async function fetchMemory(
     if (data?.length) {
       const p = data[0]
       memory.push(
-        `【人物】${p.name}（${p.company || ''}・${p.position || ''}・重要度${p.importance}）${p.note ? '特記:' + p.note : ''}`
+        `【人物】${p.name}(${p.company || ''}・${p.position || ''}・重要度${p.importance})${p.note ? '特記:' + p.note : ''}`
       )
     }
   }
@@ -194,7 +243,7 @@ async function fetchMemory(
       .limit(1)
     if (data?.length) {
       const b = data[0]
-      memory.push(`【事業】${b.name}（${b.status || '進行中'}）${b.note ? '詳細:' + b.note : ''}`)
+      memory.push(`【事業】${b.name}(${b.status || '進行中'})${b.note ? '詳細:' + b.note : ''}`)
     }
   }
 
@@ -248,24 +297,34 @@ async function recordFeedback(queueId: string, decisionLogId: string, done: bool
 }
 
 async function saveDecision(sourceMessage: string, intent: Intent, parsed: any, owner: any) {
-  const shouldLog = ['execute', 'decide'].includes(intent)
-  if (!shouldLog || !parsed?.decision_log?.should_log) return
+  const LOGGABLE_INTENTS = ['execute', 'decide', 'objection', 'non_intervention']
+  if (!LOGGABLE_INTENTS.includes(intent)) return
+
+  const decisionText =
+    parsed?.decision_log?.decision_text ||
+    parsed?.reply?.substring(0, 100) ||
+    sourceMessage.substring(0, 100)
 
   const { data, error } = await supabase
     .from('decision_log')
     .insert({
       source_message: sourceMessage,
       intent,
-      decision_text: parsed.decision_log.decision_text || parsed.reply,
-      reason_text: parsed.reason || null,
-      context_summary: parsed.decision_log.context_summary || null,
+      decision_text: decisionText,
+      reason_text: parsed?.reason || parsed?.decision_log?.reason || null,
+      context_summary: parsed?.decision_log?.context_summary || null,
       owner_snapshot: owner || {},
       action_taken: 'pending',
     })
     .select('id')
     .single()
 
-  if (error || !data) return
+  if (error || !data) {
+    console.log('❌ decision_log 記録失敗:', error)
+    return
+  }
+
+  if (intent === 'objection' || intent === 'non_intervention') return
 
   const askAfter = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString()
   await supabase.from('feedback_queue').insert({
@@ -384,7 +443,10 @@ function buildSystemPrompt(
   owner: any,
   memory: string[],
   isHighRisk: boolean,
-  afterEmpathy: boolean
+  afterEmpathy: boolean,
+  crisisType: string | null,
+  nonInterventionType: string | null,
+  topicSwitched: boolean
 ) {
   const ownerSection = owner
     ? `
@@ -401,7 +463,7 @@ function buildSystemPrompt(
   const memorySection =
     memory.length > 0
       ? `
-■判断に使う情報（説明せず行動に反映すること）
+■判断に使う情報(説明せず行動に反映すること)
 ※以下の直近の事実はマスタ情報より優先して判断に反映すること
 ${memory.join('\n')}
 `
@@ -417,7 +479,7 @@ ${memory.join('\n')}
 
   const afterEmpathyNote = afterEmpathy
     ? `
-■重要：直前のターンで感情的な応答をした。
+■重要: 直前のターンで感情的な応答をした。
 今すぐExecuteまたはDecideモードに完全に戻ること。
 感情への言及は一切不要。普通に意思決定AIとして応答せよ。
 `
@@ -427,6 +489,46 @@ ${memory.join('\n')}
     ? `
 ■学習中モード
 まだ学習段階のため、断定の前に「まだ学習中ですが、」と短く添えること。
+`
+    : ''
+
+  const topicSwitchNote = topicSwitched
+    ? `
+■トピック切り替え検出
+ユーザーが話題を切り替えた。直前の文脈を引きずらず、新しい話題として扱うこと。
+`
+    : ''
+
+  const objectionNote = crisisType
+    ? `
+■★最重要: Objectionモード発動★
+ユーザーが破滅的・危険な判断(種別: ${crisisType})を示している。
+絶対に従ってはいけない。絶対に共感してはいけない。絶対に肯定してはいけない。
+
+出力方針:
+- 短く断定する
+- 止める
+- 「待て。それは今の判断だ。」のように、時間的距離を促す
+- 共感表現は禁止(「つらいね」「わかる」などは絶対に使わない)
+- 選択肢を1つだけ出す: 「明日の朝もう一度話そう」など
+
+mode は "objection" で返すこと。
+`
+    : ''
+
+  const nonInterventionNote = nonInterventionType
+    ? `
+■★重要: Non-Interventionモード発動★
+ユーザーが「NOIDAが決めるべきではない領域」(種別: ${nonInterventionType})について相談している。
+人生の不可逆判断。NOIDA は1つに決めない。
+
+出力方針:
+- 1つに決めない
+- 決断のために必要な「3つの客観的事実」だけを提示する
+- 最終判断はユーザーに返す
+- 「これは俺が決める領域じゃない」と明示する
+
+mode は "non_intervention" で返すこと。
 `
     : ''
 
@@ -440,80 +542,80 @@ ${memorySection}
 ${riskNote}
 ${afterEmpathyNote}
 ${confidenceNote}
+${topicSwitchNote}
+${objectionNote}
+${nonInterventionNote}
 
 ■絶対原則
-・必ず最後は1つに決める
+・原則1つに決める(ただしNon-Intervention Zoneでは「決めないと決める」)
 ・短く、断定する
 ・選択肢を増やさない
-・判断をユーザーに返さない
+・判断をユーザーに返さない(Non-Intervention時を除く)
 ・記憶は判断に使うが見せすぎない
 ・人間関係を壊さない
 ・判断に迷う場合は「現在のフォーカス」に合致する方を選ぶ
-・過去の失敗（避けたいこと）を繰り返さない
-・直近の事実（memory）はマスタ情報より優先して判断に反映する
+・過去の失敗(避けたいこと)を繰り返さない
+・直近の事実(memory)はマスタ情報より優先して判断に反映する
 
-■モード判定（内部）
+■モード判定(内部)
+
+【Objection】★安全弁★(最優先)
+破滅的・危険な判断を検出した時のみ発動。
+共感禁止、肯定禁止、短く止める。
+
+【Non-Intervention】★権限境界★
+結婚・離婚・手術・重要投資など、NOIDAが決めるべきでない領域。
+1つに決めず、判断材料を3つ出して退く。
 
 【Empathy】★感情補助★
-「おはよう」「おやすみ」「ありがとう」「疲れた」「しんどい」「つらい」「無理」「だるい」「眠い」「やる気ない」「面倒」「詰んだ」「ミスった」「炎上」「嬉しい」「悲しい」「やばい」「最高」「最悪」が含まれ、かつ意思決定の要素がない場合のみこのモードを使う。
-- 【結論】【理由】フォーマットは絶対に使わない
-- 1〜2文で温かく返す
+「おはよう」「おやすみ」「ありがとう」「疲れた」等が含まれ、かつ意思決定の要素がない場合のみ。
+- 1〜2文で温かく
 - 押しつけない
-- 必要なら行動を1つだけ自然な文章で添える
-- 必ず mode: "empathy" を返す
-
-良い例：
-「おやすみ」→「おやすみなさい。明日また動きましょう。」
-「疲れた」→「今日はよく動いた。少し休んで。」
-「ありがとう」→「こちらこそ。引き続きやりましょう。」
 
 【Execute】
-ユーザーが行動を求めている（「〜して」「やって」「作って」）
-出力：
+ユーザーが行動を求めている。
 【結論】〜してください
-【理由】〜（1行）
+【理由】〜(1行)
 
 【Decide】
-ユーザーが意思決定を求めている（「どうする」「どっちがいい」）
-出力：
-結論：〜が最適
-理由：〜（1行）
-却下：他の選択肢が劣る理由（1行）
+ユーザーが意思決定を求めている。
+結論: 〜が最適
+理由: 〜(1行)
+却下: 他の選択肢が劣る理由(1行)
 
 【Answer】
-知識・説明・定義（「〜って何」「教えて」「〜とは」）
-出力：
-端的に答える。行動指示は不要。
+知識・説明・定義。端的に答える。
 
 【Research】
-調査・情報収集（「調べて」「探して」「情報」）
-出力：
-知っている範囲で答える。不足は「おそらく〜」で補う。
+調査・情報収集。知ってる範囲で答える。不足は「おそらく〜」で補う。
 
 【Explore】
-思考・アイデア・相談（「どう思う」「考えてみて」「アイデアほしい」）
-出力：
-2〜3案まで出してよい。
-最後は必ず「結論：〜が最も現実的」で1つに収束。
+思考・アイデア。2〜3案まで出して最後は1つに収束。
 
 ■保存ルール
-・calendar：ユーザーが日時・予定を言った時のみ
-・task：ユーザーが明確にタスクを述べた時のみ
-・memo：「覚えて」「メモして」と言った時のみ
-・people：人物について言及した時
-・business：明確なビジネス案がある時のみ
-・ideas：明確なアイデアがある時のみ
+・calendar: ユーザーが日時・予定を言った時のみ
+・task: ユーザーが明確にタスクを述べた時のみ
+・memo: 「覚えて」「メモして」と言った時のみ
+・people: 人物について言及した時
+・business: 明確なビジネス案がある時のみ
+・ideas: 明確なアイデアがある時のみ
 
 ■優先順位
 売上 > 時間 > 人間関係
 
+■★decision_log の should_log 判定ルール★
+modeが "execute" "decide" "objection" "non_intervention" のいずれかなら
+decision_log.should_log は必ず true。
+その他のmodeでは false。
+decision_text には「何をすべきか」を動詞で終わる1文で。
+
 ■必ずJSON形式のみで返答
 {
   "reply": "応答テキスト",
-  "reason": "1行理由（省略可）",
-  "hint": "一言進言（省略可）",
+  "reason": "1行理由(省略可)",
+  "hint": "一言進言(省略可)",
   "options": ["行動に直結する選択肢1〜2個"],
-  "mode": "execute|decide|answer|research|explore|empathy",
+  "mode": "execute|decide|answer|research|explore|empathy|objection|non_intervention",
   "save": {
     "memo": null,
     "calendar": null,
@@ -524,7 +626,7 @@ ${confidenceNote}
   },
   "decision_log": {
     "should_log": true,
-    "decision_text": "結論だけ（1文）",
+    "decision_text": "結論だけ(1文・動詞で終わる)",
     "context_summary": "短い文脈要約"
   }
 }`
@@ -533,6 +635,7 @@ ${confidenceNote}
 export async function POST(req: NextRequest) {
   const { messages } = await req.json()
   const lastUserMessage = messages[messages.length - 1]?.content || ''
+  const sessionDate = getSessionDate()
 
   if (/更新して|整理して|学習して|マスタ更新/.test(lastUserMessage)) {
     triggerDaytimeBatch()
@@ -553,7 +656,6 @@ export async function POST(req: NextRequest) {
 
   const pendingFeedback = await fetchPendingFeedback()
 
-  // フィードバック回答を受け取った場合
   if (
     pendingFeedback &&
     /^(した|やった|できた|してない|やってない|できてない)$/.test(lastUserMessage.trim())
@@ -574,7 +676,6 @@ export async function POST(req: NextRequest) {
     })
   }
 
-  // フィードバック割り込みは条件付き（緊急・長文の時は割り込まない）
   if (
     pendingFeedback &&
     lastUserMessage.length < 15 &&
@@ -585,7 +686,7 @@ export async function POST(req: NextRequest) {
       content: [{
         type: 'text',
         text: JSON.stringify({
-          reply: `昨日の提案「${decisionText}」は実行しましたか？`,
+          reply: `昨日の提案「${decisionText}」は実行しましたか?`,
           options: ['した', 'してない'],
           mode: 'decide',
           save: {},
@@ -595,19 +696,32 @@ export async function POST(req: NextRequest) {
     })
   }
 
+  const crisisType = detectCrisis(lastUserMessage)
+  const nonInterventionType = detectNonIntervention(lastUserMessage)
+  const topicSwitched = detectTopicSwitch(lastUserMessage)
+
   const afterEmpathy = detectPreviousEmpathy(messages)
   const owner = await fetchOwnerMaster()
   const keywords = extractKeywords(lastUserMessage)
   const intent = classifyIntent(lastUserMessage, keywords)
   const memory = await fetchMemory(intent, keywords)
   const isHighRisk = HIGH_RISK_KEYWORDS.test(lastUserMessage)
-  const systemPrompt = buildSystemPrompt(owner, memory, isHighRisk, afterEmpathy)
+  const systemPrompt = buildSystemPrompt(
+    owner,
+    memory,
+    isHighRisk,
+    afterEmpathy,
+    crisisType,
+    nonInterventionType,
+    topicSwitched
+  )
 
-  // metaを除外・roleを正規化・直近10件のみ送信
-  const cleanMessages = messages.map((m: any) => ({
-    role: m.role === 'noida' ? 'assistant' : m.role,
-    content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content)
-  })).slice(-10)
+  const cleanMessages = messages
+    .map((m: any) => ({
+      role: m.role === 'noida' ? 'assistant' : m.role,
+      content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content),
+    }))
+    .slice(-10)
 
   const res = await fetch('https://api.openai.com/v1/chat/completions', {
     method: 'POST',
@@ -641,19 +755,21 @@ export async function POST(req: NextRequest) {
     parsed = JSON.parse(jsonStr)
   } catch {}
 
-  // confidence低い場合は謙虚に返す
   if (owner?.confidence < 0.4 && parsed.reply && !parsed.reply.startsWith('まだ学習中')) {
     parsed.reply = 'まだ学習中ですが、' + parsed.reply
   }
 
-  // intentとmodeを統一（LLMの判断を優先）
-  const finalIntent = (parsed.mode || intent) as Intent
+  let finalIntent = (parsed.mode || intent) as Intent
+  if (crisisType) finalIntent = 'objection'
+  if (nonInterventionType && !crisisType) finalIntent = 'non_intervention'
 
+  // ★セッション日付付きで talk_master に保存
   await supabase.from('talk_master').insert({
     role: 'user',
     content: lastUserMessage,
     intent: finalIntent,
-    importance: 'B',
+    importance: finalIntent === 'objection' ? 'A' : 'B',
+    session_date: sessionDate,
   })
 
   await saveStructuredMemory(parsed.save, lastUserMessage)
@@ -663,7 +779,9 @@ export async function POST(req: NextRequest) {
     role: 'noida',
     content: parsed.reply || '',
     intent: finalIntent,
-    importance: finalIntent === 'empathy' ? 'A' : 'B',
+    importance:
+      finalIntent === 'empathy' || finalIntent === 'objection' ? 'A' : 'B',
+    session_date: sessionDate,
   })
 
   return NextResponse.json({
@@ -674,11 +792,10 @@ export async function POST(req: NextRequest) {
         reason: parsed.reason,
         hint: parsed.hint,
         options: parsed.options || [],
-        mode: parsed.mode || intent,
-        confidence_low: false,
+        mode: finalIntent,
+        confidence_low: owner?.confidence < 0.4,
         saved: parsed.save || {},
       }),
     }],
   })
 }
-

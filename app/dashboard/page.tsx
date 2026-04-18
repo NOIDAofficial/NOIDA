@@ -214,7 +214,7 @@ function MemoView({ items, onRefresh }: { items: any[], onRefresh: () => void })
   const [form, setForm] = useState({ title: '', content: '', color: 'yellow', pinned: false })
   const [search, setSearch] = useState('')
   const [saveStatus, setSaveStatus] = useState<'idle' | 'saved'>('idle')
-  const timerRef = useRef<NodeJS.Timeout | null>(null)
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   const openNew = async () => {
     const { data } = await supabase.from('memo').insert({ content: '', title: '', color: 'yellow', pinned: false }).select().single()
