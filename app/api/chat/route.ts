@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { createClient } from '@supabase/supabase-js'
 
 /**
- * NOIDA route.ts v1.4.1 (Phase 1 Day 3 完成版)
+ * NOIDA route.ts v1.4.2 (Phase 1 Day 3 完成版)
  *
  * ============================================================
  * 設計原則(v1.4で確立)
@@ -680,10 +680,12 @@ async function resolveReference(
   const confidence = top.score
   const scoreGap = scored.length > 1 ? top.score - scored[1].score : 1.0
 
-  // ★v1.4.1★ 候補が1件だけで最低限のスコア(0.2)を超えるなら自動実行
-  //   理由: 「バナナのタスク消して」でバナナを買うが1件だけヒットするケース。
-  //   単独ヒット = 他に紛らわしいものがない = 確認不要。
-  const isOnlyCandidate = scored.length === 1 && top.score >= 0.2
+  // ★v1.4.2★ 有意味なスコア(0.3以上)を持つ候補が1件だけなら自動実行
+  //   理由: scored には全30件(スコア0含む)が入ってる。scored.length===1 は起こりえない。
+  //   「パンのタスク消して」で「パンを買う」だけがスコア0.3以上なら、他は実質候補じゃない。
+  //   → 単独ヒット = 他に紛らわしいものがない = 確認不要。
+  const significantCandidates = scored.filter(s => s.score >= 0.3)
+  const isOnlyCandidate = significantCandidates.length === 1 && top.score >= 0.3
 
   // 確認が必要な条件:
   // - 単独候補ではない AND 以下のいずれか:
