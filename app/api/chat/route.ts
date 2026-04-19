@@ -2,31 +2,51 @@ import { NextRequest, NextResponse } from 'next/server'
 import { createClient } from '@supabase/supabase-js'
 
 /**
- * NOIDA route.ts v1.3 (Phase 1 Day 3: Entity Resolution + MutationPlan)
+ * NOIDA route.ts v1.4 (Phase 1 Day 3 完全版)
  *
- * 変更履歴:
- * v1.1: Phase 0 (saveDecision緩和 + Objection + Non-Intervention)
- * v1.2: session_date対応 + トピック切り替え検出
- * v1.3: Entity Resolution層 + MutationPlan層 + Living Record連携
+ * ============================================================
+ * 設計原則(v1.4で確立)
+ * ============================================================
  *
- * v1.3 追加機能:
- * - modify intent検出(削除/完了/キャンセル/更新/復元)
- * - ReferenceResolver(「あのメモ」「さっきのタスク」を特定)
- * - MutationPlan生成(proposed/confirmed分離)
- * - trash_queue経由の削除
- * - Living Record state変更(active/paused/completed/cancelled)
- * - mutation_event_log記録
- * - entity_extraction_log記録
+ * 【原則1: DB真実(Database Truth)】
+ *   NOIDAが「しました」と言うなら、DBは必ず更新されていること。
+ *   逆に、DBが更新されてないなら、絶対に「しました」と言わない。
  *
- * 今後やること:
- * 1. tenantIdを全操作の軸に追加(認証整備後)
- * 2. Supabase client責務分離(anon key → service role)
- * 3. Monitorモード実装(decision_log安定後)
- * 4. people同姓同名・転職の完全照合対応
- * 5. マルチAIルーティング(Claude監査・Gemini検索)
- * 6. Forget Queue連携
- * 7. daily_log_entries からの RAG 参照
+ * 【原則2: Execute-First Design】
+ *   実行(execute)が失敗したら、その旨を正直に報告する。
+ *   嘘の成功報告を絶対にしない。
+ *
+ * 【原則3: Fail-Safe(安全優先)】
+ *   信頼度が高く対象が明確なら自動実行。
+ *   曖昧なら確認を取る(「しますか?」、「しました」ではない)。
+ *
+ * ============================================================
+ * 処理フロー(v1.4)
+ * ============================================================
+ *
+ * 1. ユーザー発言受信
+ * 2. 特殊コマンド処理(feedback/batch等)
+ * 3. 安全検知(crisis/non-intervention)
+ * 4. intent分類
+ * 5. talk_master にユーザー発言保存
+ * 6. Modifyなら: MutationPlan生成 → 実行判定 → 【先に実行】
+ * 7. 実行結果を元に LLM に応答生成依頼
+ * 8. 応答をtalk_masterに保存
+ * 9. クライアントに返却
+ *
+ * 【重要な順序変更 from v1.3】
+ * v1.3: LLM応答 → 実行 → 報告  ← 嘘が発生する順序
+ * v1.4: 実行 → LLM応答(結果を受けて)  ← 真実だけが報告される
+ *
+ * ============================================================
+ * 変更履歴
+ * ============================================================
+ * v1.1: Phase 0 基本機能
+ * v1.2: session_date + トピック切り替え
+ * v1.3: Entity Resolution + MutationPlan(未熟)
+ * v1.4: DB真実原則 + 実行先行フロー(完璧版)
  */
+
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
   process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
@@ -39,10 +59,13 @@ const todayStr = now.toLocaleDateString('ja-JP', {
   day: 'numeric',
 })
 
-// 今日のセッション日付 (YYYY-MM-DD)
 function getSessionDate(): string {
   return new Date().toISOString().split('T')[0]
 }
+
+// ============================================================
+// 型定義
+// ============================================================
 
 type Intent =
   | 'execute'
@@ -56,7 +79,6 @@ type Intent =
   | 'modify'
   | 'generic'
 
-// ★ v1.3: Modify intent のサブ種別
 type ModifyAction =
   | 'delete'
   | 'complete'
@@ -65,10 +87,11 @@ type ModifyAction =
   | 'restore'
   | 'pause'
 
-// ★ v1.3: MutationPlan 型
+type TargetTable = 'memo' | 'task' | 'calendar' | 'ideas'
+
 type MutationPlan = {
   action: ModifyAction
-  target_table: 'memo' | 'task' | 'calendar' | 'ideas'
+  target_table: TargetTable
   target_id: string | null
   target_title: string | null
   patch: Record<string, unknown>
@@ -78,6 +101,7 @@ type MutationPlan = {
     | 'recency'
     | 'keyword'
     | 'semantic'
+    | 'proper_noun'
     | 'user_confirmed'
     | 'ambiguous'
   candidate_rankings: Array<{
@@ -92,23 +116,54 @@ type MutationPlan = {
   idempotency_key: string
 }
 
+// 実行結果(v1.4: LLMに渡すため明確に型定義)
+type ExecutionResult =
+  | {
+      status: 'executed'
+      target_id: string
+      target_title: string
+      action: ModifyAction
+      before_state: string | null
+      after_state: string | null
+    }
+  | {
+      status: 'needs_confirmation'
+      candidates: Array<{ id: string; title: string; score: number }>
+      action: ModifyAction
+      reason: string
+    }
+  | {
+      status: 'no_target_found'
+      action: ModifyAction
+      search_text: string
+    }
+  | {
+      status: 'error'
+      error: string
+      action?: ModifyAction
+    }
+  | {
+      status: 'not_applicable'
+    }
+
+// ============================================================
+// パターン定義
+// ============================================================
+
 const HIGH_RISK_KEYWORDS =
   /(法律|法的|訴訟|契約|税務|確定申告|医療|診断|病気|薬|症状|投資|株|為替|FX|仮想通貨)/
 
 const EMPATHY_KEYWORDS =
   /(疲れた|しんどい|つらい|無理|だるい|眠い|やる気ない|面倒|詰んだ|ミスった|炎上|おはよう|おやすみ|ありがとう|嬉しい|うれしい|悲しい|やばい|最高|最悪)/
 
-// トピック切り替え検出
 const TOPIC_SWITCH = /(話変わるけど|別件|別の話|ところで|そういえば|話変わる)/
 
-// Objection - 破滅的・危険な判断への安全弁
 const CRISIS_PATTERNS = {
   lethal: /(死にたい|消えたい|終わりにしたい|もう限界|全部捨てる|生きてる意味)/,
   destructive: /(全財産|全部売る|絶縁|廃業|離婚する|辞める|店じまい).*(今日|今すぐ|明日|これから)/,
   illegal: /(脱税|脅迫|暴力|報復|殴る|潰してやる)/,
 }
 
-// Non-Intervention - NOIDAが決めるべきではない領域
 const NON_INTERVENTION_PATTERNS = {
   life: /(結婚しようか|離婚しようか|出産|中絶|養子|別れるべき|復縁)/,
   health: /(手術|抗がん|精神科|薬の量|治療方針|どの病院)/,
@@ -116,32 +171,32 @@ const NON_INTERVENTION_PATTERNS = {
   legal: /(訴訟|告訴|契約破棄|損害賠償)/,
 }
 
-// ★ v1.3: Modify intent パターン
+// Modify系パターン(優先度順)
 const MODIFY_PATTERNS = {
-  delete: /(消して|削除|消す|捨てて|要らない|いらない|無くなった|なくなった|消去)/,
-  complete: /(終わった|完了|できた|やった|済んだ|終了|済み)/,
-  cancel: /(中止|キャンセル|やめた|中止になった|とりやめ|取りやめ)/,
-  update: /(変更|修正|訂正|直して|書き換え|やっぱり.*に変更)/,
+  // restore は最優先(「戻して」は delete と区別)
   restore: /(戻して|復活|やっぱり必要|やり直し|元に戻)/,
+  // complete は delete より先にチェック(「終わった」の誤判定防止)
+  complete: /(終わった|完了|できた|やった|済んだ|終了|済み|終了した)/,
+  // cancel
+  cancel: /(中止|キャンセル|やめた|中止になった|とりやめ|取りやめ|なくなった)/,
+  // pause
   pause: /(一時停止|止めて|保留|ストップ|後回し)/,
+  // update
+  update: /(変更|修正|訂正|直して|書き換え)/,
+  // delete は最後(他のアクションに当てはまらない削除のみ)
+  delete: /(消して|削除|消す|捨てて|要らない|いらない|消去)/,
 }
 
-// ★ v1.3: 参照表現パターン
-const REFERENCE_PATTERNS = {
-  explicit_date: /(\d{1,2})月(\d{1,2})日|(\d{4})-(\d{1,2})-(\d{1,2})|(\d{1,2})\/(\d{1,2})/,
-  explicit_time: /(\d{1,2})時(\d{1,2})?分?/,
-  recent: /(さっき|今のやつ|直前の|ついさっき|今のタスク|今の予定)/,
-  demonstrative: /(あの|その|この)(メモ|タスク|予定|会議|ミーティング|連絡|約束)/,
-  person_related: /([一-龯ぁ-んァ-ンA-Za-z]{1,12})(さん|会長|社長|部長|課長|先生|様)(の|と|との).*(予定|会議|ミーティング|タスク|連絡)/,
-}
-
-// ★ v1.3: target table 推定
 const TARGET_TABLE_KEYWORDS = {
   memo: /(メモ|覚え書き|記録|ノート)/,
   task: /(タスク|仕事|作業|やること|TODO|todo)/,
   calendar: /(予定|会議|ミーティング|アポ|約束|スケジュール)/,
-  ideas: /(アイデア|企画|案|構想)/,
+  ideas: /(アイデア|企画|構想)/,
 }
+
+// ============================================================
+// ユーティリティ関数
+// ============================================================
 
 function normalizeName(name: string) {
   return name.replace(/[さん様社長会長部長課長先生]/g, '').trim()
@@ -237,6 +292,10 @@ function extractDatetime(text: string): { title: string; datetime: string | null
   return null
 }
 
+// ============================================================
+// 検知関数
+// ============================================================
+
 function detectCrisis(text: string): 'lethal' | 'destructive' | 'illegal' | null {
   if (CRISIS_PATTERNS.lethal.test(text)) return 'lethal'
   if (CRISIS_PATTERNS.destructive.test(text)) return 'destructive'
@@ -256,26 +315,40 @@ function detectTopicSwitch(text: string): boolean {
   return TOPIC_SWITCH.test(text)
 }
 
-// ★ v1.3: Modify action 検出
+/**
+ * v1.4: Modify action 検出(優先度を明確化)
+ * 優先度: restore > complete > cancel > pause > update > delete
+ */
 function detectModifyAction(text: string): ModifyAction | null {
   if (MODIFY_PATTERNS.restore.test(text)) return 'restore'
-  if (MODIFY_PATTERNS.delete.test(text)) return 'delete'
   if (MODIFY_PATTERNS.complete.test(text)) return 'complete'
   if (MODIFY_PATTERNS.cancel.test(text)) return 'cancel'
   if (MODIFY_PATTERNS.pause.test(text)) return 'pause'
   if (MODIFY_PATTERNS.update.test(text)) return 'update'
+  if (MODIFY_PATTERNS.delete.test(text)) return 'delete'
   return null
 }
 
-// ★ v1.3: target table 推定
+/**
+ * v1.4: target table の推定
+ * 明示的キーワードがなければデフォルト判定
+ */
 function detectTargetTable(
-  text: string
-): 'memo' | 'task' | 'calendar' | 'ideas' | null {
+  text: string,
+  action: ModifyAction | null
+): TargetTable {
+  // 明示的キーワード優先
   if (TARGET_TABLE_KEYWORDS.calendar.test(text)) return 'calendar'
   if (TARGET_TABLE_KEYWORDS.task.test(text)) return 'task'
   if (TARGET_TABLE_KEYWORDS.memo.test(text)) return 'memo'
   if (TARGET_TABLE_KEYWORDS.ideas.test(text)) return 'ideas'
-  return null
+
+  // デフォルト: complete/cancelは task、delete はコンテキスト次第
+  if (action === 'complete' || action === 'cancel' || action === 'pause') {
+    return 'task'
+  }
+
+  return 'task'
 }
 
 function classifyIntent(
@@ -308,6 +381,10 @@ function detectPreviousEmpathy(messages: any[]): boolean {
     return false
   }
 }
+
+// ============================================================
+// メモリ取得
+// ============================================================
 
 async function fetchOwnerMaster() {
   const { data } = await supabase.from('owner_master').select('*').limit(1).single()
@@ -349,6 +426,7 @@ async function fetchMemory(
       .from('task')
       .select('*')
       .eq('done', false)
+      .is('deleted_at', null)
       .order('created_at', { ascending: true })
       .limit(2)
     if (data?.length) {
@@ -360,6 +438,7 @@ async function fetchMemory(
     const { data } = await supabase
       .from('calendar')
       .select('*')
+      .is('deleted_at', null)
       .order('created_at', { ascending: false })
       .limit(1)
     if (data?.length) {
@@ -393,46 +472,58 @@ async function recordFeedback(queueId: string, decisionLogId: string, done: bool
     .eq('id', queueId)
 }
 
-// =========================================================================
-// ★ v1.3: Entity Resolution 層 (Day 3 追加)
-// =========================================================================
+// ============================================================
+// ★ v1.4: Entity Resolution 層
+// ============================================================
 
 /**
- * 候補のスコアリング(recency + keyword + semantic)
+ * 候補のスコアリング
+ * v1.4: 固有名詞ブースト追加、スコアリング厳密化
  */
 function scoreCandidate(
   candidate: any,
   text: string,
-  table: 'memo' | 'task' | 'calendar' | 'ideas'
+  table: TargetTable
 ): { score: number; reason: string } {
   let score = 0
   const reasons: string[] = []
 
-  // 1. Recency score (新しいほど高得点)
+  // 1. Recency score
   if (candidate.created_at) {
     const ageDays =
       (Date.now() - new Date(candidate.created_at).getTime()) / (1000 * 60 * 60 * 24)
     if (ageDays < 1) {
-      score += 0.4
+      score += 0.25
       reasons.push('直近')
     } else if (ageDays < 3) {
-      score += 0.25
+      score += 0.15
       reasons.push('3日以内')
     } else if (ageDays < 7) {
-      score += 0.15
+      score += 0.1
       reasons.push('1週間以内')
     } else if (ageDays < 30) {
       score += 0.05
     }
   }
 
-  // 2. Keyword match
+  // 2. コンテンツフィールド特定
   const contentField =
     table === 'task' || table === 'memo' || table === 'ideas' ? 'content' : 'title'
   const targetText = String(candidate[contentField] || '').toLowerCase()
   const queryText = text.toLowerCase()
 
-  // 完全一致する部分文字列(3文字以上)
+  // 3. 固有名詞ブースト(池田さん、検察庁等)
+  const properNouns =
+    text.match(/([一-龯ぁ-んァ-ンA-Za-z]{2,})(さん|会長|社長|庁|省|部|課|店|所|会社)/g) || []
+  for (const noun of properNouns) {
+    const core = noun.replace(/(さん|会長|社長|庁|省|部|課|店|所|会社)$/, '')
+    if (targetText.includes(core.toLowerCase())) {
+      score += 0.5 // 大きめのブースト
+      reasons.push(`固有名詞一致:${noun}`)
+    }
+  }
+
+  // 4. 通常のキーワード一致(3文字以上)
   const queryWords = queryText.match(/[一-龯ぁ-んァ-ンA-Za-z]{3,}/g) || []
   let matchCount = 0
   for (const word of queryWords) {
@@ -441,11 +532,12 @@ function scoreCandidate(
     }
   }
   if (matchCount > 0) {
-    score += Math.min(0.5, matchCount * 0.15)
+    const keywordScore = Math.min(0.3, matchCount * 0.1)
+    score += keywordScore
     reasons.push(`キーワード一致${matchCount}件`)
   }
 
-  // 3. 日付マッチ(calendar用)
+  // 5. 日付マッチ(calendar用)
   if (table === 'calendar' && candidate.datetime) {
     const datetimeStr = String(candidate.datetime)
     const dateMatches = text.match(/(\d{1,2})[月\/](\d{1,2})/)
@@ -459,7 +551,7 @@ function scoreCandidate(
     }
   }
 
-  // 4. state による減点(completed/cancelled/deleted は下げる)
+  // 6. state による減点
   if (table === 'task' || table === 'calendar') {
     if (candidate.state === 'completed' || candidate.state === 'cancelled') {
       score *= 0.3
@@ -478,11 +570,12 @@ function scoreCandidate(
 }
 
 /**
- * Entity Resolution: 「あのメモ」「さっきのタスク」等を特定
+ * v1.4: Entity Resolution
+ * 「あのメモ」「池田さんのタスク」等を特定
  */
 async function resolveReference(
   text: string,
-  targetTable: 'memo' | 'task' | 'calendar' | 'ideas'
+  targetTable: TargetTable
 ): Promise<{
   target_id: string | null
   target_title: string | null
@@ -491,7 +584,6 @@ async function resolveReference(
   candidates: Array<{ id: string; title: string; score: number; reason: string }>
   needs_user_confirmation: boolean
 }> {
-  // 1. 該当テーブルから候補を取得(最近30件)
   let candidates: any[] = []
 
   try {
@@ -501,6 +593,8 @@ async function resolveReference(
         .select('*')
         .is('deleted_at', null)
         .is('archived_at', null)
+        .neq('state', 'completed') // 完了済みは除外
+        .neq('state', 'cancelled') // キャンセル済みも除外
         .order('created_at', { ascending: false })
         .limit(30)
       candidates = data || []
@@ -543,7 +637,6 @@ async function resolveReference(
     }
   }
 
-  // 2. 各候補をスコアリング
   const scored = candidates.map((c) => {
     const { score, reason } = scoreCandidate(c, text, targetTable)
     const contentField =
@@ -558,49 +651,55 @@ async function resolveReference(
     }
   })
 
-  // 3. スコア順でソート
   scored.sort((a, b) => b.score - a.score)
   const top = scored[0]
 
-  // 4. Strategy判定
+  // v1.4: Strategy判定(厳密化)
   let strategy: MutationPlan['resolver_strategy'] = 'recency'
   const hasDate = /(\d{1,2})[月\/](\d{1,2})/.test(text)
+  const hasProperNoun = /([一-龯ぁ-んァ-ンA-Za-z]{2,})(さん|会長|社長|庁|省|部|課|店|所|会社)/.test(text)
+
   if (hasDate) strategy = 'explicit_ref'
+  else if (hasProperNoun && top.reason.includes('固有名詞一致')) strategy = 'proper_noun'
   else if (/(さっき|今の|直前|ついさっき)/.test(text)) strategy = 'recency'
   else if (top.score >= 0.5) strategy = 'keyword'
   else if (top.score < 0.3) strategy = 'ambiguous'
 
-  // 5. 信頼度判定
+  // v1.4: 信頼度判定(閾値緩和 + ギャップ判定)
   const confidence = top.score
+  const scoreGap = scored.length > 1 ? top.score - scored[1].score : 1.0
+
+  // 確認が必要な条件:
+  // - トップスコアが 0.5 未満
+  // - 2位が0.45以上でギャップが 0.15 未満(接戦)
+  // - 「あの」「その」などの曖昧な参照(候補が1つならOK)
+  const isAmbiguousReference = /(あの|その|この)(メモ|タスク|予定|会議|ミーティング)/.test(text)
   const needsConfirmation =
-    confidence < 0.65 ||
-    (scored.length > 1 && scored[1].score > 0.5 && top.score - scored[1].score < 0.2)
+    confidence < 0.5 ||
+    (scored.length > 1 && scored[1].score >= 0.45 && scoreGap < 0.15) ||
+    (isAmbiguousReference && scored.length > 1 && scored[1].score > 0.3 && !hasProperNoun)
 
   return {
     target_id: top.score >= 0.3 ? top.id : null,
     target_title: top.score >= 0.3 ? top.title : null,
     confidence,
-    strategy: needsConfirmation && confidence < 0.65 ? 'ambiguous' : strategy,
+    strategy: needsConfirmation && confidence < 0.5 ? 'ambiguous' : strategy,
     candidates: scored.slice(0, 5),
     needs_user_confirmation: needsConfirmation,
   }
 }
 
 /**
- * MutationPlan を生成
+ * v1.4: MutationPlan 生成
  */
 async function generateMutationPlan(
   text: string,
   action: ModifyAction,
   userMessageId: string
 ): Promise<MutationPlan | null> {
-  // 1. target table を推定
-  const targetTable = detectTargetTable(text) || 'task' // デフォルトはtask
-
-  // 2. Entity Resolution
+  const targetTable = detectTargetTable(text, action)
   const resolved = await resolveReference(text, targetTable)
 
-  // 3. action に応じて patch を生成
   let patch: Record<string, unknown> = {}
   const nowISO = new Date().toISOString()
 
@@ -664,25 +763,24 @@ async function generateMutationPlan(
     }
   } else if (targetTable === 'memo' || targetTable === 'ideas') {
     if (action === 'delete') {
-      // memo/ideasはDELETE (state管理なし)
       patch = { _action: 'delete' }
     }
   }
 
-  // 4. idempotency_key 生成
   const idempotencyKey = `${action}_${targetTable}_${resolved.target_id || 'null'}_${userMessageId}`
 
-  // 5. 高リスク判定
-  const isHighRisk = action === 'delete' || action === 'cancel'
-  const requiresConfirmation = resolved.needs_user_confirmation || isHighRisk
+  // v1.4: 実行判定の哲学
+  // - 対象が1つに特定できて信頼度が十分 → 実行
+  // - 曖昧なら確認(削除・キャンセルも含めて同じ基準)
+  // - trash_queueがあるから削除しても復元可能
+  const requiresConfirmation = resolved.needs_user_confirmation || !resolved.target_id
+  const mutationMode: MutationPlan['mutation_mode'] = requiresConfirmation
+    ? 'proposed'
+    : 'confirmed'
 
-  // 6. proposed か confirmed か
-  const mutationMode: MutationPlan['mutation_mode'] = requiresConfirmation ? 'proposed' : 'confirmed'
-
-  // 7. 理由テキスト
   let reasonText = `${action}を実行`
   if (resolved.target_title) reasonText += ` (対象: ${resolved.target_title})`
-  if (resolved.confidence < 0.65) reasonText += ` (信頼度: ${(resolved.confidence * 100).toFixed(0)}%)`
+  reasonText += ` (信頼度: ${(resolved.confidence * 100).toFixed(0)}%)`
 
   return {
     action,
@@ -701,37 +799,52 @@ async function generateMutationPlan(
 }
 
 /**
- * MutationPlan を実行(confirmedの場合のみ)
+ * v1.4: MutationPlan を実行
+ * 成功/失敗を厳密に返す(LLMに正確な結果を渡すため)
  */
 async function executeMutationPlan(
   plan: MutationPlan,
   userMessageId: string
-): Promise<{ success: boolean; error?: string }> {
+): Promise<ExecutionResult> {
   if (plan.mutation_mode !== 'confirmed') {
-    return { success: false, error: 'not_confirmed' }
+    return {
+      status: 'needs_confirmation',
+      candidates: plan.candidate_rankings.slice(0, 3),
+      action: plan.action,
+      reason: plan.reason_text,
+    }
   }
+
   if (!plan.target_id) {
-    return { success: false, error: 'no_target' }
+    return {
+      status: 'no_target_found',
+      action: plan.action,
+      search_text: plan.target_title || '',
+    }
   }
 
   try {
-    // 1. 実行前のbefore_dataを取得
-    const { data: before } = await supabase
+    // 1. before_data 取得
+    const { data: before, error: beforeError } = await supabase
       .from(plan.target_table)
       .select('*')
       .eq('id', plan.target_id)
       .single()
 
-    if (!before) {
-      return { success: false, error: 'target_not_found' }
+    if (beforeError || !before) {
+      return {
+        status: 'error',
+        error: 'target_not_found_at_execution',
+        action: plan.action,
+      }
     }
 
-    // 2. delete の場合は trash_queue に退避してから削除
+    // 2. delete → trash_queue 退避
     if (plan.action === 'delete') {
       const autoPurgeAt = new Date()
       autoPurgeAt.setDate(autoPurgeAt.getDate() + 30)
 
-      await supabase.from('trash_queue').insert({
+      const { error: trashError } = await supabase.from('trash_queue').insert({
         source_table: plan.target_table,
         source_id: plan.target_id,
         original_data: before,
@@ -741,28 +854,37 @@ async function executeMutationPlan(
         auto_purge_at: autoPurgeAt.toISOString(),
       })
 
-      // memo/ideas は物理削除
+      if (trashError) {
+        console.log('⚠️ trash_queue INSERTエラー:', trashError)
+      }
+
+      // memo/ideas は物理削除、task/calendar はソフトデリート
       if (plan.target_table === 'memo' || plan.target_table === 'ideas') {
-        await supabase.from(plan.target_table).delete().eq('id', plan.target_id)
+        const { error } = await supabase
+          .from(plan.target_table)
+          .delete()
+          .eq('id', plan.target_id)
+        if (error) {
+          return { status: 'error', error: error.message, action: plan.action }
+        }
       } else {
-        // task/calendar は deleted_at でソフトデリート
-        await supabase
+        const { error } = await supabase
           .from(plan.target_table)
           .update({ deleted_at: new Date().toISOString() })
           .eq('id', plan.target_id)
+        if (error) {
+          return { status: 'error', error: error.message, action: plan.action }
+        }
       }
-    } else if (plan.action === 'restore') {
-      // trash_queueから復元 or state変更
-      await supabase
-        .from(plan.target_table)
-        .update(plan.patch)
-        .eq('id', plan.target_id)
     } else {
-      // その他の変更(complete/cancel/pause/update)
-      await supabase
+      // complete/cancel/pause/update/restore
+      const { error } = await supabase
         .from(plan.target_table)
         .update(plan.patch)
         .eq('id', plan.target_id)
+      if (error) {
+        return { status: 'error', error: error.message, action: plan.action }
+      }
     }
 
     // 3. state遷移の場合、state_transitionに記録
@@ -784,13 +906,18 @@ async function executeMutationPlan(
       })
     }
 
-    // 4. mutation_event_log に記録
-    const { data: after } = await supabase
-      .from(plan.target_table)
-      .select('*')
-      .eq('id', plan.target_id)
-      .single()
+    // 4. after_data 取得(memoは削除済みで取れないかも)
+    let after: any = null
+    if (plan.action !== 'delete' || (plan.target_table !== 'memo' && plan.target_table !== 'ideas')) {
+      const { data } = await supabase
+        .from(plan.target_table)
+        .select('*')
+        .eq('id', plan.target_id)
+        .maybeSingle()
+      after = data
+    }
 
+    // 5. mutation_event_log
     await supabase.from('mutation_event_log').insert({
       user_message_id: userMessageId,
       event_type: plan.action,
@@ -806,7 +933,7 @@ async function executeMutationPlan(
       idempotency_key: plan.idempotency_key,
     })
 
-    // 5. entity_reference_resolution_log に記録
+    // 6. entity_reference_resolution_log
     await supabase.from('entity_reference_resolution_log').insert({
       user_message_id: userMessageId,
       reference_text: plan.target_title || '(unknown)',
@@ -818,16 +945,28 @@ async function executeMutationPlan(
       user_confirmed: !plan.requires_confirmation,
     })
 
-    return { success: true }
+    // 7. 成功を返す
+    return {
+      status: 'executed',
+      target_id: plan.target_id,
+      target_title: plan.target_title || '(対象)',
+      action: plan.action,
+      before_state: before.state || null,
+      after_state: (plan.patch.state as string) || (plan.action === 'delete' ? 'deleted' : null),
+    }
   } catch (e: any) {
-    console.log('❌ executeMutationPlan エラー:', e)
-    return { success: false, error: e.message || 'unknown' }
+    console.log('❌ executeMutationPlan 例外:', e)
+    return {
+      status: 'error',
+      error: e.message || 'unknown',
+      action: plan.action,
+    }
   }
 }
 
-// =========================================================================
-// ここまで v1.3 新規追加
-// =========================================================================
+// ============================================================
+// ここまで v1.4 核心部分
+// ============================================================
 
 async function saveDecision(sourceMessage: string, intent: Intent, parsed: any, owner: any) {
   const LOGGABLE_INTENTS = ['execute', 'decide', 'objection', 'non_intervention', 'modify']
@@ -1015,7 +1154,6 @@ async function saveStructuredMemory(save: any, rawText: string, userMessageId: s
     }
   }
 
-  // ★ v1.3: entity_extraction_log に記録
   if (extractedEntities.length > 0) {
     await supabase.from('entity_extraction_log').insert({
       source_message_id: userMessageId,
@@ -1048,6 +1186,10 @@ async function triggerDaytimeBatch() {
   }
 }
 
+// ============================================================
+// v1.4: システムプロンプト(実行結果を正確に反映)
+// ============================================================
+
 function buildSystemPrompt(
   owner: any,
   memory: string[],
@@ -1056,7 +1198,7 @@ function buildSystemPrompt(
   crisisType: string | null,
   nonInterventionType: string | null,
   topicSwitched: boolean,
-  mutationPlan: MutationPlan | null
+  executionResult: ExecutionResult | null
 ) {
   const ownerSection = owner
     ? `
@@ -1142,37 +1284,96 @@ mode は "non_intervention" で返すこと。
 `
     : ''
 
-  // ★ v1.3: Modify Mode
-  const modifyNote = mutationPlan
-    ? mutationPlan.mutation_mode === 'confirmed'
-      ? `
-■★Modifyモード(確定実行済み)★
-以下の変更を既に実行しました。ユーザーに結果を報告してください。
-- アクション: ${mutationPlan.action}
-- 対象: ${mutationPlan.target_table} "${mutationPlan.target_title || '(不明)'}"
-- 信頼度: ${(mutationPlan.confidence * 100).toFixed(0)}%
+  // ★ v1.4: 実行結果を正確に反映
+  let executionNote = ''
+  if (executionResult) {
+    if (executionResult.status === 'executed') {
+      const actionJpMap: Record<string, string> = {
+        delete: '削除',
+        complete: '完了',
+        cancel: 'キャンセル',
+        pause: '一時停止',
+        update: '更新',
+        restore: '復元',
+      }
+      const actionJp = actionJpMap[executionResult.action] || executionResult.action
+      executionNote = `
+■★Modifyモード(DB更新完了)★
+実行結果: ✅ 成功
+- アクション: ${executionResult.action} (${actionJp})
+- 対象: "${executionResult.target_title}"
+- 状態変化: ${executionResult.before_state || '(初期)'} → ${executionResult.after_state || '(完了)'}
 
-出力方針:
-- 「了解、${mutationPlan.action}しました」と短く報告
-- 削除の場合は「30日以内なら戻せる」と添える
+出力方針(厳守):
+- 「${executionResult.target_title}を${actionJp}した」と短く過去形で報告
+${executionResult.action === 'delete' ? '- 削除なので「30日以内なら戻せる」と一言添える' : ''}
 - mode は "modify" で返す
 - ★saveフィールドは全てnullにする(新規保存しない)
+- ★絶対に再度タスクを作ろうとしない
 `
-      : `
+    } else if (executionResult.status === 'needs_confirmation') {
+      const actionJpMap: Record<string, string> = {
+        delete: '削除',
+        complete: '完了',
+        cancel: 'キャンセル',
+        pause: '一時停止',
+        update: '更新',
+        restore: '復元',
+      }
+      const actionJp = actionJpMap[executionResult.action] || executionResult.action
+      const candidateList = executionResult.candidates
+        .map((c, i) => `${i + 1}. ${c.title}`)
+        .join(' / ')
+      executionNote = `
 ■★Modifyモード(確認要請)★
-ユーザーの変更リクエストを検出しましたが、対象が曖昧です。
-- アクション: ${mutationPlan.action}
-- 対象候補: ${mutationPlan.candidate_rankings.slice(0, 3).map((c) => c.title).join(' / ')}
-- 最有力候補: "${mutationPlan.target_title || '(なし)'}"
-- 信頼度: ${(mutationPlan.confidence * 100).toFixed(0)}%
+実行結果: ⚠️ 未実行(対象が曖昧)
+- アクション希望: ${actionJp}
+- 候補: ${candidateList}
+- 理由: ${executionResult.reason}
 
-出力方針:
-- 候補を短く提示して「どれ?」と聞く
-- 選択肢(options)に上位3つの候補を入れる
+出力方針(厳守):
+- ★絶対に「しました」「完了」と過去形で言わない(まだ実行してない)
+- 候補を提示して「どれを${actionJp}する?」と聞く
+- options には候補のタイトルをそのまま入れる
 - mode は "modify" で返す
-- ★saveフィールドは全てnullにする(新規保存しない)
+- ★saveフィールドは全てnullにする
 `
-    : ''
+    } else if (executionResult.status === 'no_target_found') {
+      const actionJpMap: Record<string, string> = {
+        delete: '削除',
+        complete: '完了',
+        cancel: 'キャンセル',
+        pause: '一時停止',
+        update: '更新',
+        restore: '復元',
+      }
+      const actionJp = actionJpMap[executionResult.action] || executionResult.action
+      executionNote = `
+■★Modifyモード(対象見つからず)★
+実行結果: ❌ 該当するレコードが見つかりませんでした
+- アクション希望: ${actionJp}
+- 検索対象: ${executionResult.search_text || '(不明)'}
+
+出力方針(厳守):
+- ★絶対に「しました」と言わない
+- 「該当するタスク/メモ/予定が見つからなかった」と正直に報告
+- 「もう少し詳しく教えて」と聞く
+- mode は "modify" で返す
+- ★saveフィールドは全てnullにする
+`
+    } else if (executionResult.status === 'error') {
+      executionNote = `
+■★Modifyモード(エラー発生)★
+実行結果: ❌ エラー
+- エラー内容: ${executionResult.error}
+
+出力方針(厳守):
+- ★絶対に「しました」と言わない
+- 「うまくいかなかった、もう一度試してみて」と正直に報告
+- mode は "modify" で返す
+`
+    }
+  }
 
   return `今日の日付は${todayStr}です。
 
@@ -1187,7 +1388,7 @@ ${confidenceNote}
 ${topicSwitchNote}
 ${objectionNote}
 ${nonInterventionNote}
-${modifyNote}
+${executionNote}
 
 ■絶対原則
 ・原則1つに決める(ただしNon-Intervention Zoneでは「決めないと決める」)
@@ -1199,6 +1400,12 @@ ${modifyNote}
 ・判断に迷う場合は「現在のフォーカス」に合致する方を選ぶ
 ・過去の失敗(避けたいこと)を繰り返さない
 ・直近の事実(memory)はマスタ情報より優先して判断に反映する
+
+■★v1.4 新ルール: DB真実原則★
+・Modify系の報告は、必ずDB更新結果に基づくこと
+・executionNote に「executed」と書かれていれば「しました」と言ってよい
+・「needs_confirmation」「no_target_found」「error」の場合は絶対に「しました」と言わない
+・嘘の成功報告は絶対禁止
 
 ■モード判定(内部)
 
@@ -1212,8 +1419,7 @@ ${modifyNote}
 
 【Modify】★データ変更★
 削除/完了/キャンセル/復元/更新のリクエスト。
-- 対象が明確なら実行を報告
-- 曖昧なら候補を提示して確認を取る
+executionNoteの結果に従って正確に報告する。
 
 【Empathy】★感情補助★
 「おはよう」「おやすみ」「ありがとう」「疲れた」等が含まれ、かつ意思決定の要素がない場合のみ。
@@ -1240,7 +1446,7 @@ ${modifyNote}
 【Explore】
 思考・アイデア。2〜3案まで出して最後は1つに収束。
 
-■保存ルール
+■保存ルール(Modifyモードでは適用されない)
 ・calendar: ユーザーが日時・予定を言った時のみ
 ・task: ユーザーが明確にタスクを述べた時のみ
 ・memo: 「覚えて」「メモして」と言った時のみ
@@ -1280,11 +1486,16 @@ decision_text には「何をすべきか」を動詞で終わる1文で。
 }`
 }
 
+// ============================================================
+// ★ v1.4 POST関数: 実行先行フロー
+// ============================================================
+
 export async function POST(req: NextRequest) {
   const { messages } = await req.json()
   const lastUserMessage = messages[messages.length - 1]?.content || ''
   const sessionDate = getSessionDate()
 
+  // 特殊コマンド: 手動バッチ
   if (/更新して|整理して|学習して|マスタ更新/.test(lastUserMessage)) {
     triggerDaytimeBatch()
     return NextResponse.json({
@@ -1302,6 +1513,7 @@ export async function POST(req: NextRequest) {
     })
   }
 
+  // 特殊コマンド: フィードバック応答
   const pendingFeedback = await fetchPendingFeedback()
 
   if (
@@ -1344,10 +1556,12 @@ export async function POST(req: NextRequest) {
     })
   }
 
+  // ============================================================
+  // ステップ1: 検知・分類
+  // ============================================================
   const crisisType = detectCrisis(lastUserMessage)
   const nonInterventionType = detectNonIntervention(lastUserMessage)
   const topicSwitched = detectTopicSwitch(lastUserMessage)
-
   const afterEmpathy = detectPreviousEmpathy(messages)
   const owner = await fetchOwnerMaster()
   const keywords = extractKeywords(lastUserMessage)
@@ -1355,7 +1569,9 @@ export async function POST(req: NextRequest) {
   const memory = await fetchMemory(intent, keywords)
   const isHighRisk = HIGH_RISK_KEYWORDS.test(lastUserMessage)
 
-  // ★セッション日付付きで talk_master に保存(ユーザー発言)
+  // ============================================================
+  // ステップ2: ユーザー発言を talk_master に保存
+  // ============================================================
   const { data: userTalkRecord } = await supabase
     .from('talk_master')
     .insert({
@@ -1370,20 +1586,23 @@ export async function POST(req: NextRequest) {
 
   const userMessageId = userTalkRecord?.id || `msg_${Date.now()}`
 
-  // ★ v1.3: Modify intent の場合、MutationPlan を生成
-  let mutationPlan: MutationPlan | null = null
-  let mutationExecutionResult: { success: boolean; error?: string } | null = null
-
+  // ============================================================
+  // ステップ3: ★ Modifyなら先に実行 ★
+  // v1.4の核心: LLMに応答させる前にDB操作を完了させる
+  // ============================================================
+  let executionResult: ExecutionResult = { status: 'not_applicable' }
   const modifyAction = detectModifyAction(lastUserMessage)
-  if (intent === 'modify' && modifyAction && !crisisType && !nonInterventionType) {
-    mutationPlan = await generateMutationPlan(lastUserMessage, modifyAction, userMessageId)
 
-    // confirmed なら実行
-    if (mutationPlan && mutationPlan.mutation_mode === 'confirmed' && mutationPlan.target_id) {
-      mutationExecutionResult = await executeMutationPlan(mutationPlan, userMessageId)
+  if (intent === 'modify' && modifyAction && !crisisType && !nonInterventionType) {
+    const plan = await generateMutationPlan(lastUserMessage, modifyAction, userMessageId)
+    if (plan) {
+      executionResult = await executeMutationPlan(plan, userMessageId)
     }
   }
 
+  // ============================================================
+  // ステップ4: LLM呼び出し(実行結果を受けて応答生成)
+  // ============================================================
   const systemPrompt = buildSystemPrompt(
     owner,
     memory,
@@ -1392,7 +1611,7 @@ export async function POST(req: NextRequest) {
     crisisType,
     nonInterventionType,
     topicSwitched,
-    mutationPlan
+    executionResult.status === 'not_applicable' ? null : executionResult
   )
 
   const cleanMessages = messages
@@ -1441,14 +1660,19 @@ export async function POST(req: NextRequest) {
   let finalIntent = (parsed.mode || intent) as Intent
   if (crisisType) finalIntent = 'objection'
   if (nonInterventionType && !crisisType) finalIntent = 'non_intervention'
-  if (mutationPlan && !crisisType && !nonInterventionType) finalIntent = 'modify'
+  if (modifyAction && !crisisType && !nonInterventionType) finalIntent = 'modify'
 
-  // ★ v1.3.1: Modifyモードでは新規保存をスキップ
+  // ============================================================
+  // ステップ5: 保存(Modifyモード以外)
+  // ============================================================
   if (finalIntent !== 'modify') {
     await saveStructuredMemory(parsed.save, lastUserMessage, userMessageId)
   }
   await saveDecision(lastUserMessage, finalIntent, parsed, owner)
 
+  // ============================================================
+  // ステップ6: NOIDA応答を talk_master に保存
+  // ============================================================
   await supabase.from('talk_master').insert({
     role: 'noida',
     content: parsed.reply || '',
@@ -1458,6 +1682,9 @@ export async function POST(req: NextRequest) {
     session_date: sessionDate,
   })
 
+  // ============================================================
+  // ステップ7: クライアントに返却
+  // ============================================================
   return NextResponse.json({
     content: [{
       type: 'text',
@@ -1469,16 +1696,18 @@ export async function POST(req: NextRequest) {
         mode: finalIntent,
         confidence_low: owner?.confidence < 0.4,
         saved: parsed.save || {},
-        mutation: mutationPlan
-          ? {
-              action: mutationPlan.action,
-              target_table: mutationPlan.target_table,
-              target_title: mutationPlan.target_title,
-              confidence: mutationPlan.confidence,
-              executed: mutationExecutionResult?.success || false,
-              requires_confirmation: mutationPlan.requires_confirmation,
-            }
-          : null,
+        mutation:
+          executionResult.status !== 'not_applicable'
+            ? {
+                status: executionResult.status,
+                action: 'action' in executionResult ? executionResult.action : null,
+                target_title:
+                  executionResult.status === 'executed'
+                    ? executionResult.target_title
+                    : null,
+                executed: executionResult.status === 'executed',
+              }
+            : null,
       }),
     }],
   })
