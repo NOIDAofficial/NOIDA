@@ -974,24 +974,37 @@ async function executeMutationPlan(
       after = data
     }
 
-    const { data: mutationLog } = await supabase
-      .from('mutation_event_log')
-      .insert({
-        user_message_id: userMessageId,
-        event_type: plan.action,
-        source_table: plan.target_table,
-        source_id: plan.target_id,
-        before_data: before,
-        after_data: after,
-        mutation_plan: plan,
-        resolver_strategy: plan.resolver_strategy,
-        confidence: plan.confidence,
-        executed_by: 'noida',
-        mutation_mode: plan.mutation_mode,
-        idempotency_key: plan.idempotency_key,
-      })
-      .select('id')
-      .single()
+    // v1.6.3: mutation_event_log INSERT を堅牢化
+    let mutationLog: { id: string } | null = null
+    try {
+      const { data, error } = await supabase
+        .from('mutation_event_log')
+        .insert({
+          user_message_id: userMessageId,
+          event_type: plan.action,
+          source_table: plan.target_table,
+          source_id: plan.target_id,
+          before_data: before,
+          after_data: after,
+          mutation_plan: plan,
+          resolver_strategy: plan.resolver_strategy,
+          confidence: plan.confidence,
+          executed_by: 'noida',
+          mutation_mode: plan.mutation_mode,
+          idempotency_key: plan.idempotency_key,
+        })
+        .select('id')
+        .maybeSingle()
+      
+      if (error) {
+        console.log('❌ mutation_event_log INSERTエラー:', error)
+      } else {
+        mutationLog = data as { id: string } | null
+        console.log('✅ mutation_event_log 記録成功:', mutationLog?.id)
+      }
+    } catch (e: any) {
+      console.log('❌ mutation_event_log 例外:', e.message || e)
+    }
 
     await supabase.from('entity_reference_resolution_log').insert({
       user_message_id: userMessageId,
