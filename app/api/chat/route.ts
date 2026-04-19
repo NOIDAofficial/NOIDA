@@ -45,7 +45,11 @@ const todayStr = now.toLocaleDateString('ja-JP', {
 })
 
 function getSessionDate(): string {
-  return new Date().toISOString().split('T')[0]
+  // JST(UTC+9)の日付を返す。Takumaにとっての「今日」が日本時間基準になる。
+  const now = new Date()
+  const jstOffsetMs = 9 * 60 * 60 * 1000
+  const jstDate = new Date(now.getTime() + jstOffsetMs)
+  return jstDate.toISOString().split('T')[0]
 }
 
 // ============================================================
@@ -331,7 +335,7 @@ function classifyIntent(
   if (/(どうする|どっち|決めて|どれがいい|どれにする)/.test(text)) return 'decide'
   if (/(どう思う|考えて|アイデア|壁打ち|案|提案)/.test(text)) return 'explore'
   if (/(何|なに|なぜ|意味|とは|教えて|って何|どういう)/.test(text)) return 'answer'
-  if (/(して|やって|送って|返して|作って)/.test(text)) return 'execute'
+  if (/(して|やって|送って|返して|作って|追加|作成|入れて|登録|保存|記録|メモして)/.test(text)) return 'execute'
   if (keywords.people.length || keywords.businesses.length) return 'decide'
   if (EMPATHY_KEYWORDS.test(text)) return 'empathy'
   return 'generic'
@@ -1510,7 +1514,10 @@ executionNoteの結果に従って正確に報告する。
 
 ■保存ルール(Modifyモードでは適用されない)
 ・calendar: ユーザーが日時・予定を言った時のみ
-・task: ユーザーが明確にタスクを述べた時のみ
+・task: ユーザーが「タスク追加」「タスクに入れて」「やること」等と言った時
+  → save.task には【タスクの内容】だけを入れる
+  → 例: 「パンを買うタスク追加」 → save.task: "パンを買う"
+  → 悪い例: save.task に「パンを買うタスク追加」や「消して」を入れない
 ・memo: 「覚えて」「メモして」と言った時のみ
 ・people: 人物について言及した時
 ・business: 明確なビジネス案がある時のみ
