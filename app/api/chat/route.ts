@@ -1156,6 +1156,7 @@ mode は "non_intervention" で返すこと。
 - 「了解、${mutationPlan.action}しました」と短く報告
 - 削除の場合は「30日以内なら戻せる」と添える
 - mode は "modify" で返す
+- ★saveフィールドは全てnullにする(新規保存しない)
 `
       : `
 ■★Modifyモード(確認要請)★
@@ -1169,6 +1170,7 @@ mode は "non_intervention" で返すこと。
 - 候補を短く提示して「どれ?」と聞く
 - 選択肢(options)に上位3つの候補を入れる
 - mode は "modify" で返す
+- ★saveフィールドは全てnullにする(新規保存しない)
 `
     : ''
 
@@ -1441,7 +1443,10 @@ export async function POST(req: NextRequest) {
   if (nonInterventionType && !crisisType) finalIntent = 'non_intervention'
   if (mutationPlan && !crisisType && !nonInterventionType) finalIntent = 'modify'
 
-  await saveStructuredMemory(parsed.save, lastUserMessage, userMessageId)
+  // ★ v1.3.1: Modifyモードでは新規保存をスキップ
+  if (finalIntent !== 'modify') {
+    await saveStructuredMemory(parsed.save, lastUserMessage, userMessageId)
+  }
   await saveDecision(lastUserMessage, finalIntent, parsed, owner)
 
   await supabase.from('talk_master').insert({
