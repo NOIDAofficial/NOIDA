@@ -11,9 +11,10 @@ import {
   matchPerson, 
   type PersonMatchResult 
 } from '@/lib/analyzer/personMatcher'
+import { correctInput } from '@/lib/analyzer/inputCorrector'
 
 /**
- * NOIDA route.ts v1.5 (Phase 1 Day 5 完成版)
+ * NOIDA route.ts v1.5.1 (Phase 1 Day 6)
  *
  * ============================================================
  * 設計原則
@@ -21,19 +22,19 @@ import {
  *
  * 【原則1: DB真実(Database Truth)】
  *   NOIDAが「しました」と言うなら、DBは必ず更新されていること。
- *   逆に、DBが更新されてないなら、絶対に「しました」と言わない。
  *
  * 【原則2: Execute-First Design】
- *   実行(execute)が失敗したら、その旨を正直に報告する。
- *   嘘の成功報告を絶対にしない。
+ *   実行が失敗したら、その旨を正直に報告する。嘘の成功報告禁止。
  *
  * 【原則3: Fail-Safe(安全優先)】
- *   信頼度が高く対象が明確なら自動実行。
- *   曖昧なら確認を取る(「しますか?」、「しました」ではない)。
+ *   信頼度が高く対象が明確なら自動実行。曖昧なら確認。
  *
  * 【原則4: 全シグナル活用(v1.5で確立)】
- *   カテゴリ別解析(13カテゴリ) × 個人辞書 × 人物マッチングで
- *   「その人の外部の王」として察する AI を実現。
+ *   カテゴリ別解析 × 個人辞書 × 人物マッチングで「外部の王」を実現。
+ *
+ * 【原則5: 誤字許容 × 学習(v1.5.1で確立)】
+ *   3層訂正(辞書→個人辞書→LLM推論)で誤字を吸収。
+ *   使うほど Takuma の入力クセを学ぶ。
  *
  * ============================================================
  * 変更履歴
@@ -45,6 +46,7 @@ import {
  * v1.4.1: restore検索範囲拡張 + 単独候補自動実行
  * v1.4.2: isOnlyCandidate 判定を有意スコア候補数に修正
  * v1.5: analyzeQuery + Personal Dictionary + Person Matcher 統合
+ * v1.5.1: RLS修正 + 3層入力訂正 + 誤字学習システム
  */
 
 const supabase = createClient(
@@ -461,12 +463,6 @@ async function recordFeedback(queueId: string, decisionLogId: string, done: bool
 /**
  * 候補のスコアリング v1.5
  * 
- * v1.5 の革新:
- * - analyzeQuery のカテゴリ別結果を使う
- * - Personal Dictionary マッチを最強シグナルに
- * - 「パンのタスク」で keywords=[パン] が取れるので適正スコアになる
- * - Takumaの全シグナル活用思想を実装
- * 
  * シグナル重み:
  *   Personal Dictionary 一致:  +0.60  ★最強
  *   Person Matcher confident:  +0.55
@@ -632,8 +628,6 @@ function scoreCandidate(
 
 /**
  * v1.5: Entity Resolution
- * 「あのメモ」「池田さんのタスク」等を特定
- * restore時は deleted/completed/cancelled も検索対象に含める
  */
 async function resolveReference(
   text: string,
@@ -1258,7 +1252,7 @@ async function triggerDaytimeBatch() {
 }
 
 // ============================================================
-// v1.4: システムプロンプト
+// v1.5.1: システムプロンプト(誤字許容原則追加)
 // ============================================================
 
 function buildSystemPrompt(
@@ -1460,6 +1454,14 @@ ${objectionNote}
 ${nonInterventionNote}
 ${executionNote}
 
+■★v1.5.1 誤字・タイプミス許容原則★
+・ユーザーの入力は既に辞書と個人辞書で訂正済みの場合がある
+・それでも文章が不自然なら、以下を推論:
+  - 「やっぱり」が含まれ動詞が不明瞭 → 直前操作の取り消し
+  - 語順が変な場合 → 本来の語順を推測
+  - 同音異義語の可能性(音声認識エラー)を考慮
+・確信が低い時は優しく確認: 「"○○" のことですか?」
+
 ■絶対原則
 ・原則1つに決める(ただしNon-Intervention Zoneでは「決めないと決める」)
 ・短く、断定する
@@ -1557,13 +1559,35 @@ decision_text には「何をすべきか」を動詞で終わる1文で。
 }
 
 // ============================================================
-// ★ v1.5 POST関数
+// ★ v1.5.1 POST関数
 // ============================================================
 
 export async function POST(req: NextRequest) {
   const { messages } = await req.json()
-  const lastUserMessage = messages[messages.length - 1]?.content || ''
+  const rawUserMessage = messages[messages.length - 1]?.content || ''
   const sessionDate = getSessionDate()
+  
+  // v1.5.1: 入力訂正(3層:辞書→個人辞書→LLM)
+  let lastUserMessage = rawUserMessage
+  try {
+    const lastNoidaMessage = [...messages]
+      .reverse()
+      .find((m: any) => m.role === 'noida' || m.role === 'assistant')
+    const precedingContext = typeof lastNoidaMessage?.content === 'string'
+      ? lastNoidaMessage.content
+      : null
+    
+    const correctionResult = await correctInput(rawUserMessage, precedingContext)
+    if (correctionResult.was_corrected) {
+      console.log(`[Input訂正] "${correctionResult.original}" → "${correctionResult.corrected}"`)
+      for (const c of correctionResult.corrections) {
+        console.log(`  - [${c.source}] "${c.from}" → "${c.to}" (${c.pattern_type}, conf=${c.confidence.toFixed(2)})`)
+      }
+      lastUserMessage = correctionResult.corrected
+    }
+  } catch (e) {
+    console.warn('[Input訂正] エラー、訂正せずに処理続行:', e)
+  }
 
   if (/更新して|整理して|学習して|マスタ更新/.test(lastUserMessage)) {
     triggerDaytimeBatch()

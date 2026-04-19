@@ -235,3 +235,79 @@ export const PARTICLES = [
   
   export const DICTIONARY_VERSION = '1.0.0'
   export const DICTIONARY_LAST_UPDATED = '2026-04-20'
+
+  // ============================================================
+// v1.5.1: 誤字・タイプミス辞書(Tier 1: 静的辞書)
+// ============================================================
+
+/**
+ * 頻出誤字パターン(全ユーザー共通)
+ * 
+ * Tier 1(ここ): 確実な誤字のみ登録
+ * Tier 2(DB): user_input_patterns に個人クセ保存
+ * Tier 3(LLM): 未知パターンはLLM推論
+ */
+export const COMMON_TYPOS: Record<string, string[]> = {
+    // restore 系
+    '戻して': [
+      'も出して', 'もどして', '戾して', 
+      'もとして', 'もおして', '戻しt', '戻しって',
+    ],
+    '戻す': ['もどす', '戾す'],
+    '復元': ['ふくげん', '復原', '覆元'],
+    
+    // delete 系
+    '消して': ['けして', 'ケして', '消しt', '消して。'],
+    '削除': ['さくじょ', '削徐', '削余'],
+    
+    // complete 系
+    '完了': ['完了う', 'かんりょう', '関料', '完了っ'],
+    '終わった': ['おわった', '終った', '終えた', '終わt'],
+    
+    // update 系
+    '追加': ['追架', '追家', '追火', 'ついか', 'ツイカ'],
+    '修正': ['しゅうせい', '修整', '修性'],
+    '変更': ['へんこう', '変工', '変行'],
+    
+    // cancel 系
+    'キャンセル': ['きゃんせる', 'cancel', 'キャンスル', 'きゃんする'],
+    '中止': ['ちゅうし', '注視'],
+    
+    // pause 系
+    '一時停止': ['一時ていし', 'いちじ停止', '一時停子'],
+    '保留': ['ほりゅう', '保流'],
+    
+    // テーブル名
+    'タスク': ['タスt', 'たすく', 'TASK', 'Task'],
+    'メモ': ['メmo', 'めも', 'MEMO'],
+    '予定': ['よてい', '予程', '予呈'],
+    '会議': ['かいぎ', '会義', '貝議'],
+  }
+  
+  /**
+   * 辞書ベースの誤字正規化(Tier 1、同期的、高速)
+   * 既知の誤字のみ訂正
+   */
+  export function normalizeTypos(text: string): { 
+    normalized: string
+    corrections: Array<{ from: string; to: string; pattern_type: string }>
+  } {
+    let normalized = text
+    const corrections: Array<{ from: string; to: string; pattern_type: string }> = []
+    
+    for (const [correct, typos] of Object.entries(COMMON_TYPOS)) {
+      for (const typo of typos) {
+        if (normalized.includes(typo)) {
+          normalized = normalized.split(typo).join(correct)
+          corrections.push({ 
+            from: typo, 
+            to: correct, 
+            pattern_type: 'typo' 
+          })
+        }
+      }
+    }
+    
+    return { normalized, corrections }
+  }
+  
