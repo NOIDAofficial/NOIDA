@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { createClient } from '@supabase/supabase-js'
 
 /**
- * NOIDA route.ts v1.4 (Phase 1 Day 3 完全版)
+ * NOIDA route.ts v1.4.1 (Phase 1 Day 3 完成版)
  *
  * ============================================================
  * 設計原則(v1.4で確立)
@@ -532,7 +532,8 @@ function scoreCandidate(
     }
   }
   if (matchCount > 0) {
-    const keywordScore = Math.min(0.3, matchCount * 0.1)
+    // v1.4.1: 一般名詞(バナナ、ガス代など)でも十分スコアが付くように強化
+    const keywordScore = Math.min(0.5, matchCount * 0.2)
     score += keywordScore
     reasons.push(`キーワード一致${matchCount}件`)
   }
@@ -570,12 +571,14 @@ function scoreCandidate(
 }
 
 /**
- * v1.4: Entity Resolution
+ * v1.4.1: Entity Resolution
  * 「あのメモ」「池田さんのタスク」等を特定
+ * restore時は deleted/completed/cancelled も検索対象に含める
  */
 async function resolveReference(
   text: string,
-  targetTable: TargetTable
+  targetTable: TargetTable,
+  includeDeletedAndDone: boolean = false
 ): Promise<{
   target_id: string | null
   target_title: string | null
@@ -588,24 +591,32 @@ async function resolveReference(
 
   try {
     if (targetTable === 'task') {
-      const { data } = await supabase
+      // v1.4.1: restore時は completed/cancelled/deleted_at を含めて検索
+      let query = supabase
         .from('task')
         .select('*')
-        .is('deleted_at', null)
         .is('archived_at', null)
-        .neq('state', 'completed') // 完了済みは除外
-        .neq('state', 'cancelled') // キャンセル済みも除外
         .order('created_at', { ascending: false })
         .limit(30)
+      if (!includeDeletedAndDone) {
+        query = query
+          .is('deleted_at', null)
+          .neq('state', 'completed')
+          .neq('state', 'cancelled')
+      }
+      const { data } = await query
       candidates = data || []
     } else if (targetTable === 'calendar') {
-      const { data } = await supabase
+      let query = supabase
         .from('calendar')
         .select('*')
-        .is('deleted_at', null)
         .is('archived_at', null)
         .order('created_at', { ascending: false })
         .limit(30)
+      if (!includeDeletedAndDone) {
+        query = query.is('deleted_at', null)
+      }
+      const { data } = await query
       candidates = data || []
     } else if (targetTable === 'memo') {
       const { data } = await supabase
@@ -665,19 +676,27 @@ async function resolveReference(
   else if (top.score >= 0.5) strategy = 'keyword'
   else if (top.score < 0.3) strategy = 'ambiguous'
 
-  // v1.4: 信頼度判定(閾値緩和 + ギャップ判定)
+  // v1.4.1: 信頼度判定(単独候補の自動実行を追加)
   const confidence = top.score
   const scoreGap = scored.length > 1 ? top.score - scored[1].score : 1.0
 
+  // ★v1.4.1★ 候補が1件だけで最低限のスコア(0.2)を超えるなら自動実行
+  //   理由: 「バナナのタスク消して」でバナナを買うが1件だけヒットするケース。
+  //   単独ヒット = 他に紛らわしいものがない = 確認不要。
+  const isOnlyCandidate = scored.length === 1 && top.score >= 0.2
+
   // 確認が必要な条件:
-  // - トップスコアが 0.5 未満
-  // - 2位が0.45以上でギャップが 0.15 未満(接戦)
-  // - 「あの」「その」などの曖昧な参照(候補が1つならOK)
+  // - 単独候補ではない AND 以下のいずれか:
+  //   - トップスコアが 0.5 未満
+  //   - 2位が0.45以上でギャップが 0.15 未満(接戦)
+  //   - 「あの」「その」などの曖昧な参照かつ固有名詞なし
   const isAmbiguousReference = /(あの|その|この)(メモ|タスク|予定|会議|ミーティング)/.test(text)
   const needsConfirmation =
-    confidence < 0.5 ||
-    (scored.length > 1 && scored[1].score >= 0.45 && scoreGap < 0.15) ||
-    (isAmbiguousReference && scored.length > 1 && scored[1].score > 0.3 && !hasProperNoun)
+    !isOnlyCandidate && (
+      confidence < 0.5 ||
+      (scored.length > 1 && scored[1].score >= 0.45 && scoreGap < 0.15) ||
+      (isAmbiguousReference && scored.length > 1 && scored[1].score > 0.3 && !hasProperNoun)
+    )
 
   return {
     target_id: top.score >= 0.3 ? top.id : null,
@@ -698,7 +717,9 @@ async function generateMutationPlan(
   userMessageId: string
 ): Promise<MutationPlan | null> {
   const targetTable = detectTargetTable(text, action)
-  const resolved = await resolveReference(text, targetTable)
+  // v1.4.1: restore時は削除済み・完了済みも検索対象に含める
+  const includeDeletedAndDone = action === 'restore'
+  const resolved = await resolveReference(text, targetTable, includeDeletedAndDone)
 
   let patch: Record<string, unknown> = {}
   const nowISO = new Date().toISOString()
