@@ -14,22 +14,46 @@ import {
 import { correctInput } from '@/lib/analyzer/inputCorrector'
 
 /**
- * NOIDA route.ts v1.6 (Phase 1 Day 6 - シリコンバレー3AI合意版)
+ * NOIDA route.ts v1.6.4 (Phase 1 Day 6-7境界 - 深夜層2バリデーション)
  *
  * ============================================================
- * v1.6 新機能
+ * 設計原則
  * ============================================================
- * 1. pending_confirmation テーブルに候補保存
- * 2. confirmation_id をフロントエンドに返す
- * 3. 閾値強化(0.3 → 0.5, isStrongMatch ロジック)
- * 4. 詳細ログで真相追跡可能に
+ *
+ * 【原則1: DB真実(Database Truth)】
+ *   NOIDAが「しました」と言うなら、DBは必ず更新されていること。
+ *
+ * 【原則2: Execute-First Design】
+ *   実行が失敗したら、その旨を正直に報告する。嘘の成功報告禁止。
+ *
+ * 【原則3: Fail-Safe(安全優先)】
+ *   信頼度が高く対象が明確なら自動実行。曖昧なら確認。
+ *
+ * 【原則4: 全シグナル活用(v1.5で確立)】
+ *   カテゴリ別解析 × 個人辞書 × 人物マッチングで「外部の王」を実現。
+ *
+ * 【原則5: 誤字許容 × 学習(v1.5.1で確立)】
+ *   3層訂正(辞書→個人辞書→LLM推論)で誤字を吸収。
+ *   使うほど Takuma の入力クセを学ぶ。
  *
  * ============================================================
  * 変更履歴
  * ============================================================
+ * v1.1: Phase 0 基本機能
+ * v1.2: session_date + トピック切り替え
+ * v1.3: Entity Resolution + MutationPlan(未熟)
+ * v1.4: DB真実原則 + 実行先行フロー
+ * v1.4.1: restore検索範囲拡張 + 単独候補自動実行
+ * v1.4.2: isOnlyCandidate 判定を有意スコア候補数に修正
  * v1.5: analyzeQuery + Personal Dictionary + Person Matcher 統合
  * v1.5.1: RLS修正 + 3層入力訂正 + 誤字学習システム
- * v1.6: pending_confirmation + ボタン契約 + 3AI閾値
+ * v1.6.1: pending_confirmation + /api/noida/confirm (auto_execute基盤)
+ * v1.6.2: mutation_event_log + Undoボタン表示
+ * v1.6.3: mutation_event_log INSERT堅牢化 + 詳細ログ
+ * v1.6.4: ★ゴミ値バリデーション層2(cleanSaveValue)★
+ *   - LLMが「(省略可)」等のメタ注釈を save.* に返した場合、DB流入をブロック
+ *   - saveStructuredMemory の5つの保存パス全てに適用
+ *   - task/memo/calendar/ideas のINSERT直前でcleanSaveValue()実行
  */
 
 const supabase = createClient(
@@ -45,11 +69,7 @@ const todayStr = now.toLocaleDateString('ja-JP', {
 })
 
 function getSessionDate(): string {
-  // JST(UTC+9)の日付を返す。Takumaにとっての「今日」が日本時間基準になる。
-  const now = new Date()
-  const jstOffsetMs = 9 * 60 * 60 * 1000
-  const jstDate = new Date(now.getTime() + jstOffsetMs)
-  return jstDate.toISOString().split('T')[0]
+  return new Date().toISOString().split('T')[0]
 }
 
 // ============================================================
@@ -113,11 +133,9 @@ type ExecutionResult =
       action: ModifyAction
       before_state: string | null
       after_state: string | null
-      undo_token: string | null
     }
   | {
       status: 'needs_confirmation'
-      confirmation_id: string      // ★v1.6: pending_confirmation.id
       candidates: Array<{ id: string; title: string; score: number }>
       action: ModifyAction
       reason: string
@@ -335,7 +353,7 @@ function classifyIntent(
   if (/(どうする|どっち|決めて|どれがいい|どれにする)/.test(text)) return 'decide'
   if (/(どう思う|考えて|アイデア|壁打ち|案|提案)/.test(text)) return 'explore'
   if (/(何|なに|なぜ|意味|とは|教えて|って何|どういう)/.test(text)) return 'answer'
-  if (/(して|やって|送って|返して|作って|追加|作成|入れて|登録|保存|記録|メモして)/.test(text)) return 'execute'
+  if (/(して|やって|送って|返して|作って)/.test(text)) return 'execute'
   if (keywords.people.length || keywords.businesses.length) return 'decide'
   if (EMPATHY_KEYWORDS.test(text)) return 'empathy'
   return 'generic'
@@ -449,6 +467,20 @@ async function recordFeedback(queueId: string, decisionLogId: string, done: bool
 // ★ v1.5: Entity Resolution 層
 // ============================================================
 
+/**
+ * 候補のスコアリング v1.5
+ * 
+ * シグナル重み:
+ *   Personal Dictionary 一致:  +0.60  ★最強
+ *   Person Matcher confident:  +0.55
+ *   Person Matcher likely:     +0.40
+ *   Organizations 一致:        +0.40
+ *   Proper Nouns 一致:         +0.35
+ *   Keywords 一致(各):         +0.25
+ *   Datetime 一致(calendar):   +0.50
+ *   Recency:                    +0.05-0.25
+ *   State 減点:                 x0.1-0.3
+ */
 function scoreCandidate(
   candidate: any,
   text: string,
@@ -464,6 +496,7 @@ function scoreCandidate(
     table === 'task' || table === 'memo' || table === 'ideas' ? 'content' : 'title'
   const targetText = String(candidate[contentField] || '').toLowerCase()
   
+  // 1. Recency score
   if (candidate.created_at) {
     const ageDays =
       (Date.now() - new Date(candidate.created_at).getTime()) / (1000 * 60 * 60 * 24)
@@ -481,6 +514,7 @@ function scoreCandidate(
     }
   }
   
+  // 2. Personal Dictionary マッチ(最強シグナル)
   for (const match of personalMatches) {
     const entityText = match.entity.text.toLowerCase()
     if (targetText.includes(entityText)) {
@@ -496,6 +530,7 @@ function scoreCandidate(
     }
   }
   
+  // 3. Person Matcher の結果
   if (personMatch.type === 'confident' || personMatch.type === 'likely') {
     const person = personMatch.person
     if (targetText.includes(person.name.toLowerCase())) {
@@ -519,6 +554,7 @@ function scoreCandidate(
     }
   }
   
+  // 4. Organizations 一致
   for (const org of analysis.organizations) {
     if (targetText.includes(org.toLowerCase())) {
       score += 0.40
@@ -526,6 +562,7 @@ function scoreCandidate(
     }
   }
   
+  // 5. Proper Nouns 一致(個人辞書と重複しないように)
   const personalEntityTexts = new Set(
     personalMatches.map(m => m.entity.text.toLowerCase())
   )
@@ -537,6 +574,7 @@ function scoreCandidate(
     }
   }
   
+  // 6. Keywords 一致(★パンのタスク問題を解決する箇所)
   let keywordMatchCount = 0
   const matchedKeywords: string[] = []
   for (const kw of analysis.keywords) {
@@ -551,6 +589,7 @@ function scoreCandidate(
     reasons.push(`キーワード一致:${matchedKeywords.join(',')}`)
   }
   
+  // 7. Datetime マッチ(calendar用)
   if (table === 'calendar' && candidate.datetime) {
     const datetimeStr = String(candidate.datetime)
     for (const dt of analysis.datetime_absolute) {
@@ -576,6 +615,7 @@ function scoreCandidate(
     }
   }
   
+  // 8. State による減点
   if (table === 'task' || table === 'calendar') {
     if (candidate.state === 'completed' || candidate.state === 'cancelled') {
       score *= 0.3
@@ -593,6 +633,9 @@ function scoreCandidate(
   }
 }
 
+/**
+ * v1.5: Entity Resolution
+ */
 async function resolveReference(
   text: string,
   targetTable: TargetTable,
@@ -665,6 +708,7 @@ async function resolveReference(
     }
   }
 
+  // v1.5: analyzeQuery + Personal Dictionary + Person Matcher を先に呼ぶ
   const analysis = analyzeQuery(text)
   const personalMatches = await matchPersonalEntities(text)
   const personMatch = await matchPerson(text)
@@ -693,6 +737,7 @@ async function resolveReference(
   scored.sort((a, b) => b.score - a.score)
   const top = scored[0]
 
+  // Strategy判定
   let strategy: MutationPlan['resolver_strategy'] = 'recency'
   const hasDate = /(\d{1,2})[月\/](\d{1,2})/.test(text)
   const hasProperNoun = /([一-龯ぁ-んァ-ンA-Za-z]{2,})(さん|会長|社長|庁|省|部|課|店|所|会社)/.test(text)
@@ -707,43 +752,18 @@ async function resolveReference(
   const confidence = top.score
   const scoreGap = scored.length > 1 ? top.score - scored[1].score : 1.0
 
-  // v1.5.2: 閾値強化(シリコンバレー3AI合意)
-  const significantCandidates = scored.filter(s => s.score >= 0.5)
-  const isOnlyCandidate = significantCandidates.length === 1 && top.score >= 0.5
-  const isStrongMatch = top.score >= 0.70 && 
-                       (scored.length < 2 || scored[1].score <= 0.35) &&
-                       scoreGap >= 0.20
-  const canAutoExecute = isOnlyCandidate || isStrongMatch
+  // 有意味なスコア(0.3以上)を持つ候補が1件だけなら自動実行
+  const significantCandidates = scored.filter(s => s.score >= 0.3)
+  const isOnlyCandidate = significantCandidates.length === 1 && top.score >= 0.3
 
   const isAmbiguousReference = /(あの|その|この)(メモ|タスク|予定|会議|ミーティング)/.test(text)
   const needsConfirmation =
-    !canAutoExecute && (
+    !isOnlyCandidate && (
       confidence < 0.5 ||
       (scored.length > 1 && scored[1].score >= 0.45 && scoreGap < 0.15) ||
       (isAmbiguousReference && scored.length > 1 && scored[1].score > 0.3 && !hasProperNoun)
     )
 
-  console.log('[resolveReference]', {
-    text: text.substring(0, 50),
-    targetTable,
-    top3: scored.slice(0, 3).map(s => ({
-      title: s.title?.substring(0, 30),
-      score: parseFloat(s.score.toFixed(3)),
-      reason: s.reason?.substring(0, 80),
-    })),
-    confidence: parseFloat(confidence.toFixed(3)),
-    scoreGap: parseFloat(scoreGap.toFixed(3)),
-    significantCount: significantCandidates.length,
-    isOnlyCandidate,
-    isStrongMatch,
-    canAutoExecute,
-    isAmbiguousReference,
-    hasProperNoun,
-    hasDate,
-    needsConfirmation,
-    strategy,
-  })
-  
   return {
     target_id: top.score >= 0.3 ? top.id : null,
     target_title: top.score >= 0.3 ? top.title : null,
@@ -754,6 +774,9 @@ async function resolveReference(
   }
 }
 
+/**
+ * v1.4: MutationPlan 生成
+ */
 async function generateMutationPlan(
   text: string,
   action: ModifyAction,
@@ -768,32 +791,61 @@ async function generateMutationPlan(
 
   if (targetTable === 'task') {
     if (action === 'complete') {
-      patch = { state: 'completed', done: true, completed_at: nowISO, updated_at: nowISO }
+      patch = {
+        state: 'completed',
+        done: true,
+        completed_at: nowISO,
+        updated_at: nowISO,
+      }
     } else if (action === 'cancel') {
-      patch = { state: 'cancelled', cancelled_at: nowISO, updated_at: nowISO }
+      patch = {
+        state: 'cancelled',
+        cancelled_at: nowISO,
+        updated_at: nowISO,
+      }
     } else if (action === 'pause') {
-      patch = { state: 'paused', updated_at: nowISO }
+      patch = {
+        state: 'paused',
+        updated_at: nowISO,
+      }
     } else if (action === 'restore') {
       patch = {
         state: 'active',
         done: false,
         completed_at: null,
         cancelled_at: null,
-        deleted_at: null,
         updated_at: nowISO,
       }
     } else if (action === 'delete') {
-      patch = { deleted_at: nowISO, updated_at: nowISO }
+      patch = {
+        deleted_at: nowISO,
+        updated_at: nowISO,
+      }
     }
   } else if (targetTable === 'calendar') {
     if (action === 'complete') {
-      patch = { state: 'completed', completed_at: nowISO, updated_at: nowISO }
+      patch = {
+        state: 'completed',
+        completed_at: nowISO,
+        updated_at: nowISO,
+      }
     } else if (action === 'cancel') {
-      patch = { state: 'cancelled', cancelled_at: nowISO, updated_at: nowISO }
+      patch = {
+        state: 'cancelled',
+        cancelled_at: nowISO,
+        updated_at: nowISO,
+      }
     } else if (action === 'restore') {
-      patch = { state: 'scheduled', cancelled_at: null, deleted_at: null, updated_at: nowISO }
+      patch = {
+        state: 'scheduled',
+        cancelled_at: null,
+        updated_at: nowISO,
+      }
     } else if (action === 'delete') {
-      patch = { deleted_at: nowISO, updated_at: nowISO }
+      patch = {
+        deleted_at: nowISO,
+        updated_at: nowISO,
+      }
     }
   } else if (targetTable === 'memo' || targetTable === 'ideas') {
     if (action === 'delete') {
@@ -829,50 +881,16 @@ async function generateMutationPlan(
 }
 
 /**
- * v1.6: MutationPlan を実行(pending_confirmation統合版)
+ * v1.4: MutationPlan を実行
  */
 async function executeMutationPlan(
   plan: MutationPlan,
   userMessageId: string
 ): Promise<ExecutionResult> {
-  // ★v1.6: 確認要求の場合、pending_confirmation を作成
   if (plan.mutation_mode !== 'confirmed') {
-    const sessionDate = getSessionDate()
-    const topCandidates = plan.candidate_rankings
-      .slice(0, 3)
-      .map(c => ({ id: c.id, title: c.title, score: c.score }))
-    
-    const { data: pending, error: pendingError } = await supabase
-      .from('pending_confirmation')
-      .insert({
-        user_message_id: userMessageId,
-        session_date: sessionDate,
-        action: plan.action,
-        target_table: plan.target_table,
-        candidates: topCandidates,
-        mutation_plan: plan,
-        reason_text: plan.reason_text,
-        status: 'pending',
-      })
-      .select('id')
-      .single()
-    
-    if (pendingError) {
-      console.log('❌ pending_confirmation INSERTエラー:', pendingError)
-      return {
-        status: 'error',
-        error: pendingError.message,
-        action: plan.action,
-      }
-    }
-    
-    const confirmationId = (pending as any)?.id
-    console.log('[pending_confirmation 作成]', { confirmationId, candidates: topCandidates.length })
-    
     return {
       status: 'needs_confirmation',
-      confirmation_id: confirmationId,
-      candidates: topCandidates,
+      candidates: plan.candidate_rankings.slice(0, 3),
       action: plan.action,
       reason: plan.reason_text,
     }
@@ -974,36 +992,28 @@ async function executeMutationPlan(
       after = data
     }
 
-    // v1.6.3: mutation_event_log INSERT を堅牢化
-    let mutationLog: { id: string } | null = null
-    try {
-      const { data, error } = await supabase
-        .from('mutation_event_log')
-        .insert({
-          user_message_id: userMessageId,
-          event_type: plan.action,
-          source_table: plan.target_table,
-          source_id: plan.target_id,
-          before_data: before,
-          after_data: after,
-          mutation_plan: plan,
-          resolver_strategy: plan.resolver_strategy,
-          confidence: plan.confidence,
-          executed_by: 'noida',
-          mutation_mode: plan.mutation_mode,
-          idempotency_key: plan.idempotency_key,
-        })
-        .select('id')
-        .maybeSingle()
-      
-      if (error) {
-        console.log('❌ mutation_event_log INSERTエラー:', error)
-      } else {
-        mutationLog = data as { id: string } | null
-        console.log('✅ mutation_event_log 記録成功:', mutationLog?.id)
-      }
-    } catch (e: any) {
-      console.log('❌ mutation_event_log 例外:', e.message || e)
+    // v1.6.3: mutation_event_log INSERT 堅牢化(詳細ログ付き)
+    const { error: mutLogError } = await supabase.from('mutation_event_log').insert({
+      user_message_id: userMessageId,
+      event_type: plan.action,
+      source_table: plan.target_table,
+      source_id: plan.target_id,
+      before_data: before,
+      after_data: after,
+      mutation_plan: plan,
+      resolver_strategy: plan.resolver_strategy,
+      confidence: plan.confidence,
+      executed_by: 'noida',
+      mutation_mode: plan.mutation_mode,
+      idempotency_key: plan.idempotency_key,
+    })
+    if (mutLogError) {
+      console.log('⚠️ [v1.6.3] mutation_event_log INSERT エラー:', {
+        code: mutLogError.code,
+        message: mutLogError.message,
+        details: mutLogError.details,
+        hint: mutLogError.hint,
+      })
     }
 
     await supabase.from('entity_reference_resolution_log').insert({
@@ -1024,7 +1034,6 @@ async function executeMutationPlan(
       action: plan.action,
       before_state: before.state || null,
       after_state: (plan.patch.state as string) || (plan.action === 'delete' ? 'deleted' : null),
-      undo_token: (mutationLog as any)?.id || null,
     }
   } catch (e: any) {
     console.log('❌ executeMutationPlan 例外:', e)
@@ -1037,7 +1046,7 @@ async function executeMutationPlan(
 }
 
 // ============================================================
-// ここまで v1.6 核心部分
+// ここまで v1.5 核心部分
 // ============================================================
 
 async function saveDecision(sourceMessage: string, intent: Intent, parsed: any, owner: any) {
@@ -1077,23 +1086,62 @@ async function saveDecision(sourceMessage: string, intent: Intent, parsed: any, 
   })
 }
 
+
+// ============================================================
+// v1.6.4: ゴミ値排除ヘルパー(LLM幻覚対策・層2)
+// 「(省略可)」「null」「なし」等のメタ値がDBに流入するのを防ぐ
+// ============================================================
+const INVALID_SAVE_VALUES = new Set([
+  'null', 'undefined', 'NULL', 'None', 'none',
+  '(省略可)', '省略可', '(省略)', '省略', '(省略可能)', '省略可能',
+  'なし', '(なし)', '無し', '(無し)',
+  'N/A', 'n/a', 'NA',
+  '(ユーザーが言った時のみ)', '(ユーザーが言った時)',
+  '(ユーザーが明示的に述べた場合のみ)',
+  '(具体的に述べられた場合のみ)',
+])
+
+function cleanSaveValue(value: any): any {
+  if (value === null || value === undefined) return null
+  // オブジェクト型(people/business等)はそのまま返す
+  if (typeof value !== 'string') return value
+  const trimmed = value.trim()
+  if (!trimmed) return null
+  if (INVALID_SAVE_VALUES.has(trimmed)) {
+    console.log('⚠️ [v1.6.4] ゴミ値を検出してスキップ:', trimmed)
+    return null
+  }
+  // 括弧だけで始まる文字列はメタ注釈の可能性が高い
+  if (trimmed.startsWith('(') && trimmed.endsWith(')')) {
+    console.log('⚠️ [v1.6.4] 括弧メタ注釈を検出してスキップ:', trimmed)
+    return null
+  }
+  // 「省略可」「省略する」を含む文字列を強く疑う
+  if (trimmed.includes('省略可') || trimmed.includes('省略する')) {
+    console.log('⚠️ [v1.6.4] 省略関連の語を検出してスキップ:', trimmed)
+    return null
+  }
+  return trimmed
+}
+
 async function saveStructuredMemory(save: any, rawText: string, userMessageId: string) {
   if (!save) return
 
   const extractedEntities: Array<{ table: string; id: string; role: string }> = []
 
-  if (save.task) {
+  const cleanTask = cleanSaveValue(save.task)
+  if (cleanTask) {
     const { data: existing } = await supabase
       .from('task')
       .select('id')
-      .eq('content', save.task)
+      .eq('content', cleanTask)
       .is('deleted_at', null)
       .limit(1)
     if (!existing?.length) {
       const { data: inserted } = await supabase
         .from('task')
         .insert({
-          content: save.task,
+          content: cleanTask,
           done: false,
           state: 'active',
           is_user_confirmed: true,
@@ -1107,10 +1155,11 @@ async function saveStructuredMemory(save: any, rawText: string, userMessageId: s
     }
   }
 
-  if (save.memo) {
+  const cleanMemo = cleanSaveValue(save.memo)
+  if (cleanMemo) {
     const { data: inserted } = await supabase
       .from('memo')
-      .insert({ content: save.memo })
+      .insert({ content: cleanMemo })
       .select('id')
       .single()
     if (inserted) {
@@ -1118,12 +1167,13 @@ async function saveStructuredMemory(save: any, rawText: string, userMessageId: s
     }
   }
 
-  if (save.calendar) {
+  const cleanCalendar = cleanSaveValue(save.calendar)
+  if (cleanCalendar) {
     const extracted = extractDatetime(rawText)
     const { data: inserted } = await supabase
       .from('calendar')
       .insert({
-        title: save.calendar,
+        title: cleanCalendar,
         datetime: extracted?.datetime || null,
         state: 'scheduled',
         is_user_confirmed: true,
@@ -1215,10 +1265,11 @@ async function saveStructuredMemory(save: any, rawText: string, userMessageId: s
     }
   }
 
-  if (save.ideas) {
+  const cleanIdeas = cleanSaveValue(save.ideas)
+  if (cleanIdeas) {
     const { data: inserted } = await supabase
       .from('ideas')
-      .insert({ content: save.ideas })
+      .insert({ content: cleanIdeas })
       .select('id')
       .single()
     if (inserted) {
@@ -1259,7 +1310,7 @@ async function triggerDaytimeBatch() {
 }
 
 // ============================================================
-// システムプロンプト
+// v1.5.1: システムプロンプト(誤字許容原則追加)
 // ============================================================
 
 function buildSystemPrompt(
@@ -1527,10 +1578,7 @@ executionNoteの結果に従って正確に報告する。
 
 ■保存ルール(Modifyモードでは適用されない)
 ・calendar: ユーザーが日時・予定を言った時のみ
-・task: ユーザーが「タスク追加」「タスクに入れて」「やること」等と言った時
-  → save.task には【タスクの内容】だけを入れる
-  → 例: 「パンを買うタスク追加」 → save.task: "パンを買う"
-  → 悪い例: save.task に「パンを買うタスク追加」や「消して」を入れない
+・task: ユーザーが明確にタスクを述べた時のみ
 ・memo: 「覚えて」「メモして」と言った時のみ
 ・people: 人物について言及した時
 ・business: 明確なビジネス案がある時のみ
@@ -1569,7 +1617,7 @@ decision_text には「何をすべきか」を動詞で終わる1文で。
 }
 
 // ============================================================
-// ★ v1.6 POST関数
+// ★ v1.5.1 POST関数
 // ============================================================
 
 export async function POST(req: NextRequest) {
@@ -1638,17 +1686,10 @@ export async function POST(req: NextRequest) {
     })
   }
 
-  // v1.6.1: 明確な意図がある時は、昨日のフィードバック質問を横取りしない
-  const hasExplicitIntent = 
-    detectModifyAction(lastUserMessage) !== null ||
-    /追加|作成|新規|保存|メモして|覚えて/.test(lastUserMessage) ||
-    /タスク|予定|会議|メモ|アイデア|ミーティング|アポ/.test(lastUserMessage)
-
   if (
     pendingFeedback &&
     lastUserMessage.length < 15 &&
-    !HIGH_RISK_KEYWORDS.test(lastUserMessage) &&
-    !hasExplicitIntent
+    !HIGH_RISK_KEYWORDS.test(lastUserMessage)
   ) {
     const decisionText = (pendingFeedback as any).decision_log?.decision_text || '昨日の提案'
     return NextResponse.json({
@@ -1772,31 +1813,6 @@ export async function POST(req: NextRequest) {
     session_date: sessionDate,
   })
 
-  // ★v1.6: mutation レスポンスに confirmation_id と undo_token を含める
-  const mutationResponse: any = 
-    executionResult.status === 'not_applicable'
-      ? null
-      : {
-          status: executionResult.status,
-          action: 'action' in executionResult ? executionResult.action : null,
-          target_title:
-            executionResult.status === 'executed'
-              ? executionResult.target_title
-              : null,
-          executed: executionResult.status === 'executed',
-          // v1.6: ボタン契約用
-          confirmation_id: executionResult.status === 'needs_confirmation'
-            ? executionResult.confirmation_id
-            : null,
-          candidates: executionResult.status === 'needs_confirmation'
-            ? executionResult.candidates
-            : null,
-          // v1.6: Undo用
-          undo_token: executionResult.status === 'executed'
-            ? executionResult.undo_token
-            : null,
-        }
-
   return NextResponse.json({
     content: [{
       type: 'text',
@@ -1808,7 +1824,18 @@ export async function POST(req: NextRequest) {
         mode: finalIntent,
         confidence_low: owner?.confidence < 0.4,
         saved: parsed.save || {},
-        mutation: mutationResponse,
+        mutation:
+          executionResult.status !== 'not_applicable'
+            ? {
+                status: executionResult.status,
+                action: 'action' in executionResult ? executionResult.action : null,
+                target_title:
+                  executionResult.status === 'executed'
+                    ? executionResult.target_title
+                    : null,
+                executed: executionResult.status === 'executed',
+              }
+            : null,
       }),
     }],
   })
