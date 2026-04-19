@@ -1,7 +1,7 @@
 'use client'
 
 import { useState, useRef, useEffect, useCallback } from 'react'
-import { Message } from '@/lib/types'
+import { Message, Option } from '@/lib/types'
 import NoidaIcon from './NoidaIcon'
 import { supabase } from '@/lib/supabase'
 
@@ -147,7 +147,23 @@ export default function NoidaChat() {
       const data = await res.json()
       const text = data.content?.[0]?.text || ''
 
-      let parsed: { reply: string; hint?: string; options?: string[]; saved?: any } = { reply: text }
+      // v1.6: mutation フィールドを含む完全な型で parse
+      let parsed: {
+        reply: string
+        hint?: string
+        options?: string[]
+        saved?: any
+        mutation?: {
+          status: string
+          action: string | null
+          target_title: string | null
+          executed: boolean
+          confirmation_id: string | null
+          candidates: Array<{ id: string; title: string; score: number }> | null
+          undo_token: string | null
+        } | null
+      } = { reply: text }
+      
       try {
         const match = text.match(/\{[\s\S]*\}/)
         parsed = JSON.parse(match ? match[0] : text)
@@ -156,11 +172,48 @@ export default function NoidaChat() {
       }
 
       setDisabledOptions(null)
+
+      // v1.6: mutation の状態に応じてボタンを生成
+      let options: Option[] | undefined = undefined
+      let confirmation_id: string | undefined = undefined
+      let action: string | undefined = undefined
+
+      const mutation = parsed.mutation
+
+      if (mutation?.status === 'needs_confirmation' && mutation.confirmation_id && mutation.candidates) {
+        // 候補選択ボタン:confirmation_id + candidate_id を持つ
+        confirmation_id = mutation.confirmation_id
+        action = mutation.action || undefined
+        options = mutation.candidates.map((c, i) => ({
+          num: `0${i + 1}`,
+          text: c.title,
+          candidate_id: c.id,
+          kind: 'candidate' as const,
+        }))
+      } else if (mutation?.status === 'executed' && mutation.undo_token) {
+        // Undo ボタン:undo_token を持つ
+        options = [{
+          num: '01',
+          text: '取り消す',
+          undo_token: mutation.undo_token,
+          kind: 'undo' as const,
+        }]
+      } else if (parsed.options && parsed.options.length > 0) {
+        // 通常のオプションボタン
+        options = parsed.options.map((o, i) => ({
+          num: `0${i + 1}`,
+          text: o,
+          kind: 'plain' as const,
+        }))
+      }
+
       addMessage({
         role: 'noida',
         content: parsed.reply,
         hint: parsed.hint,
-        options: parsed.options?.map((o, i) => ({ num: `0${i + 1}`, text: o })),
+        options,
+        confirmation_id,
+        action,
         saved: parsed.saved
           ? Object.entries(parsed.saved).filter(([, v]) => v).map(([k, v]) => `${k}: ${typeof v === 'object' ? JSON.stringify(v) : v}`).join(' / ')
           : undefined,
@@ -169,7 +222,7 @@ export default function NoidaChat() {
       addMessage({
         role: 'noida',
         content: 'エラーが発生しました。もう一度お試しください。',
-        options: [{ num: '01', text: '再試行' }],
+        options: [{ num: '01', text: '再試行', kind: 'plain' }],
       })
     }
 
@@ -188,11 +241,82 @@ export default function NoidaChat() {
     await callNoida(msg, messages)
   }, [input, loading, addMessage, callNoida, messages, scrollToBottom])
 
-  const handleOption = useCallback((msgId: string, text: string) => {
+  /**
+   * v1.6: ボタン契約の実装
+   * 
+   * - kind='candidate': /api/noida/confirm に POST(確定実行)
+   * - kind='undo':      undo_token を使って取り消し(Day7で実装)
+   * - kind='plain':     従来通り、ラベルをテキストとして送信
+   */
+  const handleOption = useCallback(async (msgId: string, opt: Option) => {
     if (disabledOptions === msgId || loading) return
     setDisabledOptions(msgId)
-    handleSend(text)
-  }, [disabledOptions, loading, handleSend])
+
+    const parentMsg = messages.find(m => m.id === msgId)
+
+    // ★ 候補選択(delete確認など) ★
+    if (opt.kind === 'candidate' && opt.candidate_id && parentMsg?.confirmation_id) {
+      setLoading(true)
+      
+      // ユーザーメッセージとして選択を記録(UI表示)
+      addMessage({ role: 'user', content: opt.text })
+      
+      try {
+        const res = await fetch('/api/noida/confirm', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            confirmation_id: parentMsg.confirmation_id,
+            candidate_id: opt.candidate_id,
+            user_action: 'confirm',
+          }),
+        })
+        const data = await res.json()
+        
+        // Undo ボタン付きメッセージを追加
+        const undoOption: Option | null = data.undo_token
+          ? { num: '01', text: '取り消す', undo_token: data.undo_token, kind: 'undo' as const }
+          : null
+
+        addMessage({
+          role: 'noida',
+          content: data.reply || '処理しました',
+          options: undoOption ? [undoOption] : undefined,
+        })
+      } catch {
+        addMessage({
+          role: 'noida',
+          content: '確定処理でエラーが発生しました。',
+        })
+      }
+      
+      setLoading(false)
+      scrollToBottom('smooth')
+      return
+    }
+
+    // ★ Undo ボタン ★
+    if (opt.kind === 'undo' && opt.undo_token) {
+      setLoading(true)
+      addMessage({ role: 'user', content: '取り消す' })
+      
+      try {
+        // 簡易的にテキストで /api/chat に送る(Day7で専用エンドポイント化予定)
+        await callNoida(`直前の操作を取り消して(undo_token: ${opt.undo_token})`, messages)
+      } catch {
+        addMessage({
+          role: 'noida',
+          content: '取り消しに失敗しました。',
+        })
+      }
+      
+      setLoading(false)
+      return
+    }
+
+    // ★ 通常のオプションボタン(plain) ★
+    handleSend(opt.text)
+  }, [disabledOptions, loading, handleSend, messages, addMessage, callNoida, scrollToBottom])
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && !e.shiftKey && !isComposingRef.current) {
@@ -296,19 +420,30 @@ export default function NoidaChat() {
                     <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: 8 }}>
                       {msg.options.map((opt) => {
                         const isDisabled = disabledOptions === msg.id || loading
+                        const isUndo = opt.kind === 'undo'
+                        const isCandidate = opt.kind === 'candidate'
+                        
                         return (
                           <button
-                            key={opt.num}
-                            onClick={() => handleOption(msg.id, opt.text)}
+                            key={opt.num + (opt.candidate_id || opt.undo_token || '')}
+                            onClick={() => handleOption(msg.id, opt)}
                             disabled={isDisabled}
                             style={{
                               display: 'flex',
                               alignItems: 'center',
                               gap: 12,
                               padding: '10px 14px',
-                              border: `0.5px solid ${isDisabled ? 'rgba(255,255,255,0.06)' : 'rgba(255,255,255,0.12)'}`,
+                              border: `0.5px solid ${
+                                isDisabled ? 'rgba(255,255,255,0.06)' : 
+                                isUndo ? 'rgba(255,180,100,0.3)' :
+                                isCandidate ? 'rgba(100,180,255,0.3)' :
+                                'rgba(255,255,255,0.12)'
+                              }`,
                               borderRadius: 10,
-                              background: isDisabled ? 'rgba(255,255,255,0.01)' : 'rgba(255,255,255,0.03)',
+                              background: isDisabled ? 'rgba(255,255,255,0.01)' : 
+                                          isUndo ? 'rgba(255,180,100,0.05)' :
+                                          isCandidate ? 'rgba(100,180,255,0.05)' :
+                                          'rgba(255,255,255,0.03)',
                               cursor: isDisabled ? 'default' : 'pointer',
                               textAlign: 'left',
                               width: '100%',
@@ -316,11 +451,16 @@ export default function NoidaChat() {
                               opacity: isDisabled ? 0.4 : 1,
                             }}
                           >
-                            {/* ラジオサークル */}
+                            {/* アイコン(ボタン種類で変える) */}
                             <div style={{
                               width: 16, height: 16,
                               borderRadius: '50%',
-                              border: `1.5px solid ${isDisabled ? 'rgba(255,255,255,0.2)' : 'rgba(255,255,255,0.4)'}`,
+                              border: `1.5px solid ${
+                                isDisabled ? 'rgba(255,255,255,0.2)' : 
+                                isUndo ? 'rgba(255,180,100,0.6)' :
+                                isCandidate ? 'rgba(100,180,255,0.6)' :
+                                'rgba(255,255,255,0.4)'
+                              }`,
                               flexShrink: 0,
                               display: 'flex', alignItems: 'center', justifyContent: 'center',
                             }}>
@@ -334,7 +474,9 @@ export default function NoidaChat() {
                             </div>
                             <span style={{
                               fontSize: 13,
-                              color: isDisabled ? 'rgba(255,255,255,0.4)' : 'rgba(255,255,255,0.8)',
+                              color: isDisabled ? 'rgba(255,255,255,0.4)' : 
+                                     isUndo ? 'rgba(255,180,100,0.9)' :
+                                     'rgba(255,255,255,0.8)',
                               flex: 1,
                             }}>
                               {opt.text}
