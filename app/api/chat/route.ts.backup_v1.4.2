@@ -13,10 +13,10 @@ import {
 } from '@/lib/analyzer/personMatcher'
 
 /**
- * NOIDA route.ts v1.5 (Phase 1 Day 5 完成版)
+ * NOIDA route.ts v1.4.2 (Phase 1 Day 3 完成版)
  *
  * ============================================================
- * 設計原則
+ * 設計原則(v1.4で確立)
  * ============================================================
  *
  * 【原則1: DB真実(Database Truth)】
@@ -31,9 +31,23 @@ import {
  *   信頼度が高く対象が明確なら自動実行。
  *   曖昧なら確認を取る(「しますか?」、「しました」ではない)。
  *
- * 【原則4: 全シグナル活用(v1.5で確立)】
- *   カテゴリ別解析(13カテゴリ) × 個人辞書 × 人物マッチングで
- *   「その人の外部の王」として察する AI を実現。
+ * ============================================================
+ * 処理フロー(v1.4)
+ * ============================================================
+ *
+ * 1. ユーザー発言受信
+ * 2. 特殊コマンド処理(feedback/batch等)
+ * 3. 安全検知(crisis/non-intervention)
+ * 4. intent分類
+ * 5. talk_master にユーザー発言保存
+ * 6. Modifyなら: MutationPlan生成 → 実行判定 → 【先に実行】
+ * 7. 実行結果を元に LLM に応答生成依頼
+ * 8. 応答をtalk_masterに保存
+ * 9. クライアントに返却
+ *
+ * 【重要な順序変更 from v1.3】
+ * v1.3: LLM応答 → 実行 → 報告  ← 嘘が発生する順序
+ * v1.4: 実行 → LLM応答(結果を受けて)  ← 真実だけが報告される
  *
  * ============================================================
  * 変更履歴
@@ -41,10 +55,7 @@ import {
  * v1.1: Phase 0 基本機能
  * v1.2: session_date + トピック切り替え
  * v1.3: Entity Resolution + MutationPlan(未熟)
- * v1.4: DB真実原則 + 実行先行フロー
- * v1.4.1: restore検索範囲拡張 + 単独候補自動実行
- * v1.4.2: isOnlyCandidate 判定を有意スコア候補数に修正
- * v1.5: analyzeQuery + Personal Dictionary + Person Matcher 統合
+ * v1.4: DB真実原則 + 実行先行フロー(完璧版)
  */
 
 const supabase = createClient(
@@ -116,6 +127,7 @@ type MutationPlan = {
   idempotency_key: string
 }
 
+// 実行結果(v1.4: LLMに渡すため明確に型定義)
 type ExecutionResult =
   | {
       status: 'executed'
@@ -170,12 +182,19 @@ const NON_INTERVENTION_PATTERNS = {
   legal: /(訴訟|告訴|契約破棄|損害賠償)/,
 }
 
+// Modify系パターン(優先度順)
 const MODIFY_PATTERNS = {
+  // restore は最優先(「戻して」は delete と区別)
   restore: /(戻して|復活|やっぱり必要|やり直し|元に戻)/,
+  // complete は delete より先にチェック(「終わった」の誤判定防止)
   complete: /(終わった|完了|できた|やった|済んだ|終了|済み|終了した)/,
+  // cancel
   cancel: /(中止|キャンセル|やめた|中止になった|とりやめ|取りやめ|なくなった)/,
+  // pause
   pause: /(一時停止|止めて|保留|ストップ|後回し)/,
+  // update
   update: /(変更|修正|訂正|直して|書き換え)/,
+  // delete は最後(他のアクションに当てはまらない削除のみ)
   delete: /(消して|削除|消す|捨てて|要らない|いらない|消去)/,
 }
 
@@ -307,6 +326,10 @@ function detectTopicSwitch(text: string): boolean {
   return TOPIC_SWITCH.test(text)
 }
 
+/**
+ * v1.4: Modify action 検出(優先度を明確化)
+ * 優先度: restore > complete > cancel > pause > update > delete
+ */
 function detectModifyAction(text: string): ModifyAction | null {
   if (MODIFY_PATTERNS.restore.test(text)) return 'restore'
   if (MODIFY_PATTERNS.complete.test(text)) return 'complete'
@@ -317,15 +340,21 @@ function detectModifyAction(text: string): ModifyAction | null {
   return null
 }
 
+/**
+ * v1.4: target table の推定
+ * 明示的キーワードがなければデフォルト判定
+ */
 function detectTargetTable(
   text: string,
   action: ModifyAction | null
 ): TargetTable {
+  // 明示的キーワード優先
   if (TARGET_TABLE_KEYWORDS.calendar.test(text)) return 'calendar'
   if (TARGET_TABLE_KEYWORDS.task.test(text)) return 'task'
   if (TARGET_TABLE_KEYWORDS.memo.test(text)) return 'memo'
   if (TARGET_TABLE_KEYWORDS.ideas.test(text)) return 'ideas'
 
+  // デフォルト: complete/cancelは task、delete はコンテキスト次第
   if (action === 'complete' || action === 'cancel' || action === 'pause') {
     return 'task'
   }
@@ -455,44 +484,21 @@ async function recordFeedback(queueId: string, decisionLogId: string, done: bool
 }
 
 // ============================================================
-// ★ v1.5: Entity Resolution 層
+// ★ v1.4: Entity Resolution 層
 // ============================================================
 
 /**
- * 候補のスコアリング v1.5
- * 
- * v1.5 の革新:
- * - analyzeQuery のカテゴリ別結果を使う
- * - Personal Dictionary マッチを最強シグナルに
- * - 「パンのタスク」で keywords=[パン] が取れるので適正スコアになる
- * - Takumaの全シグナル活用思想を実装
- * 
- * シグナル重み:
- *   Personal Dictionary 一致:  +0.60  ★最強
- *   Person Matcher confident:  +0.55
- *   Person Matcher likely:     +0.40
- *   Organizations 一致:        +0.40
- *   Proper Nouns 一致:         +0.35
- *   Keywords 一致(各):         +0.25
- *   Datetime 一致(calendar):   +0.50
- *   Recency:                    +0.05-0.25
- *   State 減点:                 x0.1-0.3
+ * 候補のスコアリング
+ * v1.4: 固有名詞ブースト追加、スコアリング厳密化
  */
 function scoreCandidate(
   candidate: any,
   text: string,
-  table: TargetTable,
-  analysis: QueryAnalysis,
-  personalMatches: PersonalDictionaryMatch[],
-  personMatch: PersonMatchResult
+  table: TargetTable
 ): { score: number; reason: string } {
   let score = 0
   const reasons: string[] = []
-  
-  const contentField =
-    table === 'task' || table === 'memo' || table === 'ideas' ? 'content' : 'title'
-  const targetText = String(candidate[contentField] || '').toLowerCase()
-  
+
   // 1. Recency score
   if (candidate.created_at) {
     const ageDays =
@@ -504,115 +510,60 @@ function scoreCandidate(
       score += 0.15
       reasons.push('3日以内')
     } else if (ageDays < 7) {
-      score += 0.10
+      score += 0.1
       reasons.push('1週間以内')
     } else if (ageDays < 30) {
       score += 0.05
     }
   }
-  
-  // 2. Personal Dictionary マッチ(最強シグナル)
-  for (const match of personalMatches) {
-    const entityText = match.entity.text.toLowerCase()
-    if (targetText.includes(entityText)) {
-      score += 0.60
-      reasons.push(`個人辞書一致:${match.entity.text}(${match.entity.entity_type})`)
-    }
-    for (const alias of match.entity.aliases) {
-      if (alias.length >= 2 && targetText.includes(alias)) {
-        score += 0.45
-        reasons.push(`個人辞書エイリアス一致:${alias}`)
-        break
-      }
-    }
-  }
-  
-  // 3. Person Matcher の結果
-  if (personMatch.type === 'confident' || personMatch.type === 'likely') {
-    const person = personMatch.person
-    if (targetText.includes(person.name.toLowerCase())) {
-      const weight = personMatch.type === 'confident' ? 0.55 : 0.40
-      score += weight
-      reasons.push(`人物マッチ:${person.name}(${personMatch.type})`)
-    } else {
-      const surnameCandidates = [
-        person.name.substring(0, 3),
-        person.name.substring(0, 2),
-        person.name.substring(0, 1),
-      ]
-      for (const sc of surnameCandidates) {
-        if (sc.length >= 2 && targetText.includes(sc.toLowerCase())) {
-          const weight = personMatch.type === 'confident' ? 0.45 : 0.30
-          score += weight
-          reasons.push(`人物姓マッチ:${sc}`)
-          break
-        }
-      }
+
+  // 2. コンテンツフィールド特定
+  const contentField =
+    table === 'task' || table === 'memo' || table === 'ideas' ? 'content' : 'title'
+  const targetText = String(candidate[contentField] || '').toLowerCase()
+  const queryText = text.toLowerCase()
+
+  // 3. 固有名詞ブースト(池田さん、検察庁等)
+  const properNouns =
+    text.match(/([一-龯ぁ-んァ-ンA-Za-z]{2,})(さん|会長|社長|庁|省|部|課|店|所|会社)/g) || []
+  for (const noun of properNouns) {
+    const core = noun.replace(/(さん|会長|社長|庁|省|部|課|店|所|会社)$/, '')
+    if (targetText.includes(core.toLowerCase())) {
+      score += 0.5 // 大きめのブースト
+      reasons.push(`固有名詞一致:${noun}`)
     }
   }
-  
-  // 4. Organizations 一致
-  for (const org of analysis.organizations) {
-    if (targetText.includes(org.toLowerCase())) {
-      score += 0.40
-      reasons.push(`組織一致:${org}`)
+
+  // 4. 通常のキーワード一致(3文字以上)
+  const queryWords = queryText.match(/[一-龯ぁ-んァ-ンA-Za-z]{3,}/g) || []
+  let matchCount = 0
+  for (const word of queryWords) {
+    if (targetText.includes(word.toLowerCase())) {
+      matchCount++
     }
   }
-  
-  // 5. Proper Nouns 一致(個人辞書と重複しないように)
-  const personalEntityTexts = new Set(
-    personalMatches.map(m => m.entity.text.toLowerCase())
-  )
-  for (const pn of analysis.proper_nouns) {
-    if (personalEntityTexts.has(pn.toLowerCase())) continue
-    if (targetText.includes(pn.toLowerCase())) {
-      score += 0.35
-      reasons.push(`固有名詞一致:${pn}`)
-    }
+  if (matchCount > 0) {
+    // v1.4.1: 一般名詞(バナナ、ガス代など)でも十分スコアが付くように強化
+    const keywordScore = Math.min(0.5, matchCount * 0.2)
+    score += keywordScore
+    reasons.push(`キーワード一致${matchCount}件`)
   }
-  
-  // 6. Keywords 一致(★パンのタスク問題を解決する箇所)
-  let keywordMatchCount = 0
-  const matchedKeywords: string[] = []
-  for (const kw of analysis.keywords) {
-    if (kw.length >= 2 && targetText.includes(kw.toLowerCase())) {
-      keywordMatchCount++
-      matchedKeywords.push(kw)
-    }
-  }
-  if (keywordMatchCount > 0) {
-    const kwScore = Math.min(0.50, keywordMatchCount * 0.25)
-    score += kwScore
-    reasons.push(`キーワード一致:${matchedKeywords.join(',')}`)
-  }
-  
-  // 7. Datetime マッチ(calendar用)
+
+  // 5. 日付マッチ(calendar用)
   if (table === 'calendar' && candidate.datetime) {
     const datetimeStr = String(candidate.datetime)
-    for (const dt of analysis.datetime_absolute) {
-      if (dt.month !== undefined && dt.day !== undefined) {
-        const monthStr = String(dt.month).padStart(2, '0')
-        const dayStr = String(dt.day).padStart(2, '0')
-        if (datetimeStr.includes(`-${monthStr}-${dayStr}`)) {
-          score += 0.50
-          reasons.push(`日付一致:${dt.raw}`)
-          break
-        }
-      }
-    }
-    for (const dt of analysis.datetime_relative) {
-      const target = new Date()
-      target.setDate(target.getDate() + dt.offset_days)
-      const targetIso = target.toISOString().split('T')[0]
-      if (datetimeStr.includes(targetIso)) {
-        score += 0.50
-        reasons.push(`相対日時一致:${dt.raw}`)
-        break
+    const dateMatches = text.match(/(\d{1,2})[月\/](\d{1,2})/)
+    if (dateMatches) {
+      const month = dateMatches[1].padStart(2, '0')
+      const day = dateMatches[2].padStart(2, '0')
+      if (datetimeStr.includes(`-${month}-${day}`)) {
+        score += 0.5
+        reasons.push('日付一致')
       }
     }
   }
-  
-  // 8. State による減点
+
+  // 6. state による減点
   if (table === 'task' || table === 'calendar') {
     if (candidate.state === 'completed' || candidate.state === 'cancelled') {
       score *= 0.3
@@ -623,7 +574,7 @@ function scoreCandidate(
       reasons.push('削除済み(減点)')
     }
   }
-  
+
   return {
     score: Math.min(1.0, score),
     reason: reasons.join(' / ') || '低スコア',
@@ -631,7 +582,7 @@ function scoreCandidate(
 }
 
 /**
- * v1.5: Entity Resolution
+ * v1.4.1: Entity Resolution
  * 「あのメモ」「池田さんのタスク」等を特定
  * restore時は deleted/completed/cancelled も検索対象に含める
  */
@@ -651,6 +602,7 @@ async function resolveReference(
 
   try {
     if (targetTable === 'task') {
+      // v1.4.1: restore時は completed/cancelled/deleted_at を含めて検索
       let query = supabase
         .from('task')
         .select('*')
@@ -736,25 +688,33 @@ async function resolveReference(
   scored.sort((a, b) => b.score - a.score)
   const top = scored[0]
 
-  // Strategy判定
+  // v1.4: Strategy判定(厳密化)
   let strategy: MutationPlan['resolver_strategy'] = 'recency'
   const hasDate = /(\d{1,2})[月\/](\d{1,2})/.test(text)
   const hasProperNoun = /([一-龯ぁ-んァ-ンA-Za-z]{2,})(さん|会長|社長|庁|省|部|課|店|所|会社)/.test(text)
 
   if (hasDate) strategy = 'explicit_ref'
-  else if (hasProperNoun && top.reason.includes('人物マッチ')) strategy = 'proper_noun'
+  else if (hasProperNoun && top.reason.includes('固有名詞一致')) strategy = 'proper_noun'
   else if (/(さっき|今の|直前|ついさっき)/.test(text)) strategy = 'recency'
-  else if (top.reason.includes('個人辞書一致')) strategy = 'proper_noun'
   else if (top.score >= 0.5) strategy = 'keyword'
   else if (top.score < 0.3) strategy = 'ambiguous'
 
+  // v1.4.1: 信頼度判定(単独候補の自動実行を追加)
   const confidence = top.score
   const scoreGap = scored.length > 1 ? top.score - scored[1].score : 1.0
 
-  // 有意味なスコア(0.3以上)を持つ候補が1件だけなら自動実行
+  // ★v1.4.2★ 有意味なスコア(0.3以上)を持つ候補が1件だけなら自動実行
+  //   理由: scored には全30件(スコア0含む)が入ってる。scored.length===1 は起こりえない。
+  //   「パンのタスク消して」で「パンを買う」だけがスコア0.3以上なら、他は実質候補じゃない。
+  //   → 単独ヒット = 他に紛らわしいものがない = 確認不要。
   const significantCandidates = scored.filter(s => s.score >= 0.3)
   const isOnlyCandidate = significantCandidates.length === 1 && top.score >= 0.3
 
+  // 確認が必要な条件:
+  // - 単独候補ではない AND 以下のいずれか:
+  //   - トップスコアが 0.5 未満
+  //   - 2位が0.45以上でギャップが 0.15 未満(接戦)
+  //   - 「あの」「その」などの曖昧な参照かつ固有名詞なし
   const isAmbiguousReference = /(あの|その|この)(メモ|タスク|予定|会議|ミーティング)/.test(text)
   const needsConfirmation =
     !isOnlyCandidate && (
@@ -782,6 +742,7 @@ async function generateMutationPlan(
   userMessageId: string
 ): Promise<MutationPlan | null> {
   const targetTable = detectTargetTable(text, action)
+  // v1.4.1: restore時は削除済み・完了済みも検索対象に含める
   const includeDeletedAndDone = action === 'restore'
   const resolved = await resolveReference(text, targetTable, includeDeletedAndDone)
 
@@ -854,6 +815,10 @@ async function generateMutationPlan(
 
   const idempotencyKey = `${action}_${targetTable}_${resolved.target_id || 'null'}_${userMessageId}`
 
+  // v1.4: 実行判定の哲学
+  // - 対象が1つに特定できて信頼度が十分 → 実行
+  // - 曖昧なら確認(削除・キャンセルも含めて同じ基準)
+  // - trash_queueがあるから削除しても復元可能
   const requiresConfirmation = resolved.needs_user_confirmation || !resolved.target_id
   const mutationMode: MutationPlan['mutation_mode'] = requiresConfirmation
     ? 'proposed'
@@ -881,6 +846,7 @@ async function generateMutationPlan(
 
 /**
  * v1.4: MutationPlan を実行
+ * 成功/失敗を厳密に返す(LLMに正確な結果を渡すため)
  */
 async function executeMutationPlan(
   plan: MutationPlan,
@@ -904,6 +870,7 @@ async function executeMutationPlan(
   }
 
   try {
+    // 1. before_data 取得
     const { data: before, error: beforeError } = await supabase
       .from(plan.target_table)
       .select('*')
@@ -918,6 +885,7 @@ async function executeMutationPlan(
       }
     }
 
+    // 2. delete → trash_queue 退避
     if (plan.action === 'delete') {
       const autoPurgeAt = new Date()
       autoPurgeAt.setDate(autoPurgeAt.getDate() + 30)
@@ -936,6 +904,7 @@ async function executeMutationPlan(
         console.log('⚠️ trash_queue INSERTエラー:', trashError)
       }
 
+      // memo/ideas は物理削除、task/calendar はソフトデリート
       if (plan.target_table === 'memo' || plan.target_table === 'ideas') {
         const { error } = await supabase
           .from(plan.target_table)
@@ -954,6 +923,7 @@ async function executeMutationPlan(
         }
       }
     } else {
+      // complete/cancel/pause/update/restore
       const { error } = await supabase
         .from(plan.target_table)
         .update(plan.patch)
@@ -963,6 +933,7 @@ async function executeMutationPlan(
       }
     }
 
+    // 3. state遷移の場合、state_transitionに記録
     if (
       (plan.target_table === 'task' || plan.target_table === 'calendar') &&
       plan.patch.state
@@ -981,6 +952,7 @@ async function executeMutationPlan(
       })
     }
 
+    // 4. after_data 取得(memoは削除済みで取れないかも)
     let after: any = null
     if (plan.action !== 'delete' || (plan.target_table !== 'memo' && plan.target_table !== 'ideas')) {
       const { data } = await supabase
@@ -991,6 +963,7 @@ async function executeMutationPlan(
       after = data
     }
 
+    // 5. mutation_event_log
     await supabase.from('mutation_event_log').insert({
       user_message_id: userMessageId,
       event_type: plan.action,
@@ -1006,6 +979,7 @@ async function executeMutationPlan(
       idempotency_key: plan.idempotency_key,
     })
 
+    // 6. entity_reference_resolution_log
     await supabase.from('entity_reference_resolution_log').insert({
       user_message_id: userMessageId,
       reference_text: plan.target_title || '(unknown)',
@@ -1017,6 +991,7 @@ async function executeMutationPlan(
       user_confirmed: !plan.requires_confirmation,
     })
 
+    // 7. 成功を返す
     return {
       status: 'executed',
       target_id: plan.target_id,
@@ -1036,7 +1011,7 @@ async function executeMutationPlan(
 }
 
 // ============================================================
-// ここまで v1.5 核心部分
+// ここまで v1.4 核心部分
 // ============================================================
 
 async function saveDecision(sourceMessage: string, intent: Intent, parsed: any, owner: any) {
@@ -1258,7 +1233,7 @@ async function triggerDaytimeBatch() {
 }
 
 // ============================================================
-// v1.4: システムプロンプト
+// v1.4: システムプロンプト(実行結果を正確に反映)
 // ============================================================
 
 function buildSystemPrompt(
@@ -1355,6 +1330,7 @@ mode は "non_intervention" で返すこと。
 `
     : ''
 
+  // ★ v1.4: 実行結果を正確に反映
   let executionNote = ''
   if (executionResult) {
     if (executionResult.status === 'executed') {
@@ -1557,7 +1533,7 @@ decision_text には「何をすべきか」を動詞で終わる1文で。
 }
 
 // ============================================================
-// ★ v1.5 POST関数
+// ★ v1.4 POST関数: 実行先行フロー
 // ============================================================
 
 export async function POST(req: NextRequest) {
@@ -1565,6 +1541,7 @@ export async function POST(req: NextRequest) {
   const lastUserMessage = messages[messages.length - 1]?.content || ''
   const sessionDate = getSessionDate()
 
+  // 特殊コマンド: 手動バッチ
   if (/更新して|整理して|学習して|マスタ更新/.test(lastUserMessage)) {
     triggerDaytimeBatch()
     return NextResponse.json({
@@ -1582,6 +1559,7 @@ export async function POST(req: NextRequest) {
     })
   }
 
+  // 特殊コマンド: フィードバック応答
   const pendingFeedback = await fetchPendingFeedback()
 
   if (
@@ -1624,6 +1602,9 @@ export async function POST(req: NextRequest) {
     })
   }
 
+  // ============================================================
+  // ステップ1: 検知・分類
+  // ============================================================
   const crisisType = detectCrisis(lastUserMessage)
   const nonInterventionType = detectNonIntervention(lastUserMessage)
   const topicSwitched = detectTopicSwitch(lastUserMessage)
@@ -1634,6 +1615,9 @@ export async function POST(req: NextRequest) {
   const memory = await fetchMemory(intent, keywords)
   const isHighRisk = HIGH_RISK_KEYWORDS.test(lastUserMessage)
 
+  // ============================================================
+  // ステップ2: ユーザー発言を talk_master に保存
+  // ============================================================
   const { data: userTalkRecord } = await supabase
     .from('talk_master')
     .insert({
@@ -1648,6 +1632,10 @@ export async function POST(req: NextRequest) {
 
   const userMessageId = userTalkRecord?.id || `msg_${Date.now()}`
 
+  // ============================================================
+  // ステップ3: ★ Modifyなら先に実行 ★
+  // v1.4の核心: LLMに応答させる前にDB操作を完了させる
+  // ============================================================
   let executionResult: ExecutionResult = { status: 'not_applicable' }
   const modifyAction = detectModifyAction(lastUserMessage)
 
@@ -1658,6 +1646,9 @@ export async function POST(req: NextRequest) {
     }
   }
 
+  // ============================================================
+  // ステップ4: LLM呼び出し(実行結果を受けて応答生成)
+  // ============================================================
   const systemPrompt = buildSystemPrompt(
     owner,
     memory,
@@ -1717,11 +1708,17 @@ export async function POST(req: NextRequest) {
   if (nonInterventionType && !crisisType) finalIntent = 'non_intervention'
   if (modifyAction && !crisisType && !nonInterventionType) finalIntent = 'modify'
 
+  // ============================================================
+  // ステップ5: 保存(Modifyモード以外)
+  // ============================================================
   if (finalIntent !== 'modify') {
     await saveStructuredMemory(parsed.save, lastUserMessage, userMessageId)
   }
   await saveDecision(lastUserMessage, finalIntent, parsed, owner)
 
+  // ============================================================
+  // ステップ6: NOIDA応答を talk_master に保存
+  // ============================================================
   await supabase.from('talk_master').insert({
     role: 'noida',
     content: parsed.reply || '',
@@ -1731,6 +1728,9 @@ export async function POST(req: NextRequest) {
     session_date: sessionDate,
   })
 
+  // ============================================================
+  // ステップ7: クライアントに返却
+  // ============================================================
   return NextResponse.json({
     content: [{
       type: 'text',
