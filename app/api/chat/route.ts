@@ -1618,10 +1618,17 @@ export async function POST(req: NextRequest) {
     })
   }
 
+  // v1.6.1: 明確な意図がある時は、昨日のフィードバック質問を横取りしない
+  const hasExplicitIntent = 
+    detectModifyAction(lastUserMessage) !== null ||
+    /追加|作成|新規|保存|メモして|覚えて/.test(lastUserMessage) ||
+    /タスク|予定|会議|メモ|アイデア|ミーティング|アポ/.test(lastUserMessage)
+
   if (
     pendingFeedback &&
     lastUserMessage.length < 15 &&
-    !HIGH_RISK_KEYWORDS.test(lastUserMessage)
+    !HIGH_RISK_KEYWORDS.test(lastUserMessage) &&
+    !hasExplicitIntent
   ) {
     const decisionText = (pendingFeedback as any).decision_log?.decision_text || '昨日の提案'
     return NextResponse.json({
