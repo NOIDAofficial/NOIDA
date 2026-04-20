@@ -187,6 +187,11 @@ const MODIFY_PATTERNS = {
   update: /(変更|修正|訂正|直して|書き換え)/,
   delete: /(消して|削除|消す|捨てて|要らない|いらない|消去)/,
 }
+// ============================================================
+// v1.6.5: 受諾ワード検出(秘書哲学 - State 2 待機中の能動応答)
+// ============================================================
+const ACKNOWLEDGMENT_PATTERNS = 
+  /^(了解|おけ|OK|ok|ありがと(う)?|あざす|サンキュー|thx|thanks|okay)[!！。\.]*$/
 
 const TARGET_TABLE_KEYWORDS = {
   memo: /(メモ|覚え書き|記録|ノート)/,
@@ -1706,6 +1711,84 @@ export async function POST(req: NextRequest) {
     })
   }
 
+// ============================================================
+  // v1.6.5: 受諾ワード → 能動応答(State 2 秘書哲学)
+  // ============================================================
+  if (ACKNOWLEDGMENT_PATTERNS.test(lastUserMessage.trim())) {
+    console.log('[v1.6.5 State2] 受諾ワード検出:', lastUserMessage.trim())
+    
+    const { data: pendingTasks } = await supabase
+      .from('task')
+      .select('content, importance')
+      .eq('done', false)
+      .is('deleted_at', null)
+      .neq('state', 'completed')
+      .neq('state', 'cancelled')
+      .order('importance', { ascending: true })
+      .order('created_at', { ascending: true })
+      .limit(1)
+    
+    const nowISO = new Date().toISOString()
+    const { data: upcomingEvents } = await supabase
+      .from('calendar')
+      .select('title, datetime')
+      .is('deleted_at', null)
+      .neq('state', 'cancelled')
+      .gte('datetime', nowISO)
+      .order('datetime', { ascending: true })
+      .limit(1)
+    
+    let reply: string
+    
+    if (pendingTasks?.length) {
+      reply = `次「${pendingTasks[0].content}」やろう。`
+    } else if (upcomingEvents?.length) {
+      const dt = new Date(upcomingEvents[0].datetime)
+      const today = new Date()
+      const isToday = dt.toDateString() === today.toDateString()
+      const timeStr = dt.toLocaleTimeString('ja-JP', { 
+        hour: '2-digit', 
+        minute: '2-digit',
+        hour12: false
+      })
+      const dateStr = isToday 
+        ? `今日${timeStr}`
+        : `${dt.getMonth() + 1}月${dt.getDate()}日${timeStr}`
+      reply = `${dateStr}に「${upcomingEvents[0].title}」があるよ。`
+    } else {
+      reply = '他に何かある?'
+    }
+    
+    await supabase.from('talk_master').insert({
+      role: 'user',
+      content: lastUserMessage,
+      intent: 'empathy',
+      importance: 'C',
+      session_date: sessionDate,
+    })
+    
+    await supabase.from('talk_master').insert({
+      role: 'noida',
+      content: reply,
+      intent: 'empathy',
+      importance: 'C',
+      session_date: sessionDate,
+    })
+    
+    return NextResponse.json({
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          reply,
+          options: [],
+          mode: 'empathy',
+          save: {},
+          decision_log: { should_log: false },
+        }),
+      }],
+    })
+  }
+  
   const crisisType = detectCrisis(lastUserMessage)
   const nonInterventionType = detectNonIntervention(lastUserMessage)
   const topicSwitched = detectTopicSwitch(lastUserMessage)
