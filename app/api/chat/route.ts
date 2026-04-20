@@ -353,6 +353,62 @@ const REPLY_PATTERNS = {
   conflict_different: /^(違う|別|違います|別件|別のやつ|違うやつ|別物|別だ|違うよ|別件で|別に追加)$/,
   modify_approve: /^(削除する|消す|消して|する|実行|お願い|頼む|進めて|やって|確定|確定する|承認|はい|yes|OK|ok|オッケー|了解|いいよ|どうぞ)$/,
   modify_reject: /^(やめる|やめて|中止|キャンセル|取り消し|いいや|いえ|no|no|ダメ|違う|やらない)$/,
+  // ★v2.0.2 Bug J 修正: 候補選択パターン
+  candidate_select_number: /^([1-5]|[1-5]番目|[1-5]つ目|[一二三四五]|最初|2つ目|3つ目|さっきの|最後)$/,
+  candidate_select_time: /^(今日|明日|明後日|昨日|今週|来週)?\s*(\d{1,2})時(の|のやつ|のほう|の方)?$/,
+  candidate_select_ordinal: /^(\d{1,2})時(の|のやつ|のほう|の方|のほうの)/,
+}
+
+/**
+ * ★v2.0.2: 複数候補から時刻ベースで1つを選ぶ
+ * @returns 選択された候補の index(0-based)、該当なしは -1
+ */
+function matchCandidateByTime(
+  userText: string,
+  candidates: Array<{ id: string; title: string }>
+): number {
+  const trimmed = userText.trim()
+  // 「14時」「15時」などを抽出
+  const timeMatch = trimmed.match(/(\d{1,2})時/)
+  if (!timeMatch) return -1
+  const targetHour = timeMatch[1]
+  // 各候補の title に「XX時」が含まれてるか
+  for (let i = 0; i < candidates.length; i++) {
+    const title = candidates[i].title
+    if (new RegExp(`${targetHour}時`).test(title)) {
+      return i
+    }
+  }
+  return -1
+}
+
+/**
+ * ★v2.0.2: 「1」「2」「最初」などから候補 index を拾う
+ */
+function matchCandidateByNumber(
+  userText: string,
+  candidateCount: number
+): number {
+  const trimmed = userText.trim()
+  const numMap: Record<string, number> = {
+    '1': 0, '一': 0, '最初': 0,
+    '2': 1, '二': 1, '2つ目': 1, '2番目': 1,
+    '3': 2, '三': 2, '3つ目': 2, '3番目': 2,
+    '4': 3, '四': 3, '4つ目': 3, '4番目': 3,
+    '5': 4, '五': 4, '5つ目': 4, '5番目': 4,
+  }
+  // 単純一致
+  if (numMap[trimmed] !== undefined) {
+    const idx = numMap[trimmed]
+    return idx < candidateCount ? idx : -1
+  }
+  // 「1番目」「2番目」パターン
+  const ordinalMatch = trimmed.match(/^([1-5])(番目|つ目)$/)
+  if (ordinalMatch) {
+    const idx = parseInt(ordinalMatch[1]) - 1
+    return idx < candidateCount ? idx : -1
+  }
+  return -1
 }
 
 const TARGET_TABLE_KEYWORDS = {
@@ -1240,9 +1296,32 @@ async function resolveReference(
       targetTable === 'task' || targetTable === 'memo' || targetTable === 'ideas'
         ? 'content'
         : 'title'
+    // ★v2.0.2 Bug J 修正: calendar は title + datetime で候補表示
+    let displayTitle = String(c[contentField] || '').substring(0, 50)
+    if (targetTable === 'calendar' && c.datetime) {
+      try {
+        const dt = new Date(c.datetime)
+        const today = new Date()
+        const isToday = dt.toDateString() === today.toDateString()
+        const tomorrow = new Date(today)
+        tomorrow.setDate(tomorrow.getDate() + 1)
+        const isTomorrow = dt.toDateString() === tomorrow.toDateString()
+        const timeStr = dt.toLocaleTimeString('ja-JP', {
+          hour: '2-digit', minute: '2-digit', hour12: false,
+        })
+        const dateLabel = isToday
+          ? `今日${timeStr}`
+          : isTomorrow
+          ? `明日${timeStr}`
+          : `${dt.getMonth() + 1}月${dt.getDate()}日${timeStr}`
+        displayTitle = `${dateLabel}の${displayTitle}`
+      } catch (e) {
+        // datetime 不正なら title のみ
+      }
+    }
     return {
       id: c.id,
-      title: String(c[contentField] || '').substring(0, 50),
+      title: displayTitle,
       score,
       reason,
       matched_alias,
@@ -2927,11 +3006,142 @@ export async function POST(req: NextRequest) {
   }
 
   const modifyPending = await fetchLatestModifyPending()
-  if (modifyPending && (replyType === 'modify_approve' || replyType === 'modify_reject')) {
+  // ★v2.0.2 Bug J 修正: 候補が複数ある時は候補選択 replyType も処理する
+  if (modifyPending) {
+    const ss = modifyPending.subject_snapshot || {}
+    const candidateCount = ss.candidate_ids?.length || 0
+    
+    // === 候補選択パターン(複数候補から1つ選ぶ)===
+    if (candidateCount >= 2) {
+      const candidates = (ss.candidate_ids || []).map((id: string, idx: number) => ({
+        id,
+        title: ss.rendered_titles?.[idx] || '(タイトル不明)',
+      }))
+      
+      // 時刻ベース選択 or 番号選択
+      let selectedIdx = matchCandidateByTime(lastUserMessage, candidates)
+      if (selectedIdx === -1) {
+        selectedIdx = matchCandidateByNumber(lastUserMessage, candidateCount)
+      }
+      
+      if (selectedIdx >= 0) {
+        const plan = modifyPending.mutation_plan as MutationPlan
+        const chosenId = candidates[selectedIdx].id
+        const chosenTitle = candidates[selectedIdx].title
+        
+        const executedPlan: MutationPlan = {
+          ...plan,
+          target_id: chosenId,
+          target_title: chosenTitle,
+          mutation_mode: 'confirmed',
+          requires_confirmation: false,
+        }
+        const result = await executeMutationPlan(executedPlan, `modify_select_${modifyPending.id}`, ss.user_text || '')
+        await resolvePending(modifyPending.id, 'confirmed')
+        
+        const actionJp = ss.action_jp || plan.action
+        let reply: string
+        if (result.status === 'executed') {
+          reply = `${chosenTitle}を${actionJp}した。`
+          if (plan.action === 'delete') reply += '(30日以内なら戻せる)'
+        } else {
+          reply = `${actionJp}できなかった、もう一度試して。`
+        }
+        
+        await supabase.from('talk_master').insert({
+          role: 'user',
+          content: rawUserMessage,
+          content_parsed: lastUserMessage !== rawUserMessage ? lastUserMessage : null,
+          intent: 'modify',
+          importance: 'B',
+          session_date: sessionDate,
+        })
+        await supabase.from('talk_master').insert({
+          role: 'noida',
+          content: reply,
+          intent: 'modify',
+          importance: 'B',
+          session_date: sessionDate,
+        })
+        
+        console.log('✅ [v2.0.2 CANDIDATE SELECT]', {
+          pending_id: modifyPending.id,
+          selected_idx: selectedIdx,
+          chosen_id: chosenId,
+          chosen_title: chosenTitle,
+          status: result.status,
+        })
+        
+        return NextResponse.json({
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              reply,
+              options: [],
+              mode: 'modify',
+              save: {},
+              decision_log: { should_log: true, decision_text: reply },
+            }),
+          }],
+        })
+      }
+      
+      // modify_reject は複数候補でも有効
+      if (replyType === 'modify_reject') {
+        await resolvePending(modifyPending.id, 'cancelled')
+        const reply = 'わかった、やめとく。'
+        await supabase.from('talk_master').insert({
+          role: 'user', content: rawUserMessage,
+          content_parsed: lastUserMessage !== rawUserMessage ? lastUserMessage : null,
+          intent: 'modify', importance: 'C', session_date: sessionDate,
+        })
+        await supabase.from('talk_master').insert({
+          role: 'noida', content: reply,
+          intent: 'modify', importance: 'C', session_date: sessionDate,
+        })
+        return NextResponse.json({
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              reply, options: [], mode: 'modify', save: {},
+              decision_log: { should_log: false },
+            }),
+          }],
+        })
+      }
+      
+      // ★v2.0.2 Bug K 修正: 候補選択できない返答は候補の再提示
+      //   ここで return しないと通常フローに流れて conflict 誤突入する
+      const reply = `${ss.action_jp || '変更'}する予定を選んで:\n${candidates.map((c: any, i: number) => `${i + 1}. ${c.title}`).join('\n')}`
+      const optionList = candidates.map((c: any) => c.title)
+      
+      await supabase.from('talk_master').insert({
+        role: 'user', content: rawUserMessage,
+        content_parsed: lastUserMessage !== rawUserMessage ? lastUserMessage : null,
+        intent: 'modify', importance: 'B', session_date: sessionDate,
+      })
+      await supabase.from('talk_master').insert({
+        role: 'noida', content: reply,
+        intent: 'modify', importance: 'B', session_date: sessionDate,
+      })
+      
+      console.log('🔁 [v2.0.2] 候補選択再プロンプト:', { candidates: candidates.length })
+      
+      return NextResponse.json({
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            reply, options: optionList, mode: 'modify', save: {},
+            decision_log: { should_log: false },
+          }),
+        }],
+      })
+    }
+    
+    // === 従来の approve/reject(候補1つの時)===
     if (replyType === 'modify_approve') {
       const plan = modifyPending.mutation_plan as MutationPlan
-      const ss = modifyPending.subject_snapshot || {}
-      if (ss.candidate_ids?.length === 1) {
+      if (candidateCount === 1) {
         const executedPlan: MutationPlan = {
           ...plan,
           target_id: ss.candidate_ids[0],
@@ -2944,8 +3154,13 @@ export async function POST(req: NextRequest) {
 
         const actionJp = ss.action_jp || plan.action
         const targetTitle = ss.rendered_titles?.[0] || plan.target_title || '対象'
-        let reply = `${targetTitle}を${actionJp}した。`
-        if (plan.action === 'delete') reply += '(30日以内なら戻せる)'
+        let reply: string
+        if (result.status === 'executed') {
+          reply = `${targetTitle}を${actionJp}した。`
+          if (plan.action === 'delete') reply += '(30日以内なら戻せる)'
+        } else {
+          reply = `${actionJp}できなかった、もう一度試して。`
+        }
 
         await supabase.from('talk_master').insert({
           role: 'user',
@@ -3379,6 +3594,43 @@ export async function POST(req: NextRequest) {
     }
     parsed.mode = 'execute'
     parsed.options = []
+  }
+
+  // ============================================================
+  // ★v2.0.2 Bug L 修正: modify needs_confirmation 時の強制ガード
+  // ============================================================
+  // resolveReference が複数候補 or 低 confidence で needs_confirmation を返した時、
+  // LLM が「削除した」と嘘応答する事故を防ぐ。コード側で強制書き換え。
+  if (executionResult.status === 'needs_confirmation') {
+    const actionJpMap: Record<string, string> = {
+      delete: '削除', complete: '完了', cancel: 'キャンセル',
+      pause: '一時停止', update: '更新', restore: '復元',
+    }
+    const actionJp = actionJpMap[executionResult.action] || executionResult.action
+    const candidates = executionResult.candidates
+    
+    console.log('🛡️ [v2.0.2 GUARD] modify needs_confirmation — LLM 応答を強制書き換え', {
+      action: executionResult.action,
+      candidate_count: candidates.length,
+      original_reply: (parsed.reply || '').substring(0, 50),
+    })
+    
+    if (candidates.length === 0) {
+      parsed.reply = `該当が見つからなかった、もう一度内容を教えて。`
+      parsed.options = []
+    } else if (candidates.length === 1) {
+      parsed.reply = `「${candidates[0].title}」を${actionJp}する?`
+      parsed.options = [actionJp === '削除' ? '削除する' : '実行', 'やめる']
+    } else {
+      const listStr = candidates.map((c, i) => `${i + 1}. ${c.title}`).join('\n')
+      parsed.reply = `${actionJp}するのはどれ?\n${listStr}`
+      parsed.options = candidates.map(c => c.title)
+    }
+    parsed.save = {
+      memo: null, calendar: null, task: null,
+      people: null, business: null, ideas: null,
+    }
+    parsed.mode = 'modify'
   }
 
   // ★v2.0 FSM: clarification 応答時に conversation_state 作成
