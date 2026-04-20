@@ -368,14 +368,43 @@ function matchCandidateByTime(
   candidates: Array<{ id: string; title: string }>
 ): number {
   const trimmed = userText.trim()
-  // 「14時」「15時」などを抽出
-  const timeMatch = trimmed.match(/(\d{1,2})時/)
-  if (!timeMatch) return -1
-  const targetHour = timeMatch[1]
-  // 各候補の title に「XX時」が含まれてるか
+  
+  // ★v2.0.3 優先1: タイトル完全一致(options タップした時)
+  for (let i = 0; i < candidates.length; i++) {
+    if (candidates[i].title === trimmed) return i
+  }
+  
+  // ★v2.0.3 優先2: タイトルを含む(「明日14:00の営業会議」のような長い文字列)
+  for (let i = 0; i < candidates.length; i++) {
+    if (trimmed.includes(candidates[i].title)) return i
+  }
+  
+  // ★v2.0.3 優先3: 時刻抽出(「14時」「15:00」「14時のやつ」等)
+  //   - 「XX時」形式
+  //   - 「XX:MM」形式
+  //   - 「XX」形式(数字のみ)
+  const timePatterns = [
+    /(\d{1,2})時/,           // 14時
+    /(\d{1,2}):\d{2}/,       // 14:00
+    /(\d{1,2}):(\d{2})/,     // 14:00 別キャプチャ用
+  ]
+  let targetHour: string | null = null
+  for (const pattern of timePatterns) {
+    const m = trimmed.match(pattern)
+    if (m) {
+      targetHour = m[1]
+      break
+    }
+  }
+  if (!targetHour) return -1
+  
+  // 各候補の title に対応する時刻が含まれるか
+  // candidate title 例: "明日14:00の営業会議" or "明日14時の営業会議"
   for (let i = 0; i < candidates.length; i++) {
     const title = candidates[i].title
-    if (new RegExp(`${targetHour}時`).test(title)) {
+    // 「14時」「14:00」「14:30」等すべて拾う
+    const candidateTime = title.match(/(\d{1,2})(?:時|:\d{2})/)
+    if (candidateTime && candidateTime[1] === targetHour) {
       return i
     }
   }
