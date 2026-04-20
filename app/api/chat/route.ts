@@ -32,9 +32,22 @@ import { correctInput } from '@/lib/analyzer/inputCorrector'
  * 継承:v1.9.0 Synchronous Truth / v1.9.1 Bug G 根治
  */
 
+// ★v2.1.0: Service Role Key を優先使用(Least Privilege)
+//   SUPABASE_SERVICE_ROLE_KEY が設定されていればそれを使う(サーバー専用、全権限)
+//   未設定時は NEXT_PUBLIC_SUPABASE_ANON_KEY にフォールバック(従来動作)
+const SUPABASE_KEY =
+  process.env.SUPABASE_SERVICE_ROLE_KEY ||
+  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
+
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
-  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
+  SUPABASE_KEY,
+  {
+    auth: {
+      autoRefreshToken: false,
+      persistSession: false,
+    },
+  }
 )
 
 const now = new Date()
