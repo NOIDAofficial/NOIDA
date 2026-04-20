@@ -14,7 +14,7 @@ import {
 import { correctInput } from '@/lib/analyzer/inputCorrector'
 
 /**
- * NOIDA route.ts v1.6.4 (Phase 1 Day 6-7境界 - 深夜層2バリデーション)
+ * NOIDA route.ts v1.7.0 (Phase 1 Day 7 - 仮予定システム + State2受諾応答)
  *
  * ============================================================
  * 設計原則
@@ -50,10 +50,13 @@ import { correctInput } from '@/lib/analyzer/inputCorrector'
  * v1.6.1: pending_confirmation + /api/noida/confirm (auto_execute基盤)
  * v1.6.2: mutation_event_log + Undoボタン表示
  * v1.6.3: mutation_event_log INSERT堅牢化 + 詳細ログ
- * v1.6.4: ★ゴミ値バリデーション層2(cleanSaveValue)★
- *   - LLMが「(省略可)」等のメタ注釈を save.* に返した場合、DB流入をブロック
- *   - saveStructuredMemory の5つの保存パス全てに適用
- *   - task/memo/calendar/ideas のINSERT直前でcleanSaveValue()実行
+ * v1.6.4: ゴミ値バリデーション層2(cleanSaveValue)
+ * v1.6.5: 受諾ワード→能動応答(State 2 秘書哲学)
+ * v1.7.0: ★仮予定システム(Tentative Event)★
+ *   - 情報不足(誰と/何の)の予定は is_tentative=true で保存
+ *   - 同時間帯に既存予定がある場合は「同じ?違う?」をユーザーに確認
+ *   - 「同じ」なら既存仮予定を確定(UPDATE)、「違う」なら別件として併存
+ *   - ACK処理で【仮】表示と詳細催促も統合
  */
 
 const supabase = createClient(
@@ -187,11 +190,36 @@ const MODIFY_PATTERNS = {
   update: /(変更|修正|訂正|直して|書き換え)/,
   delete: /(消して|削除|消す|捨てて|要らない|いらない|消去)/,
 }
+
 // ============================================================
 // v1.6.5: 受諾ワード検出(秘書哲学 - State 2 待機中の能動応答)
 // ============================================================
-const ACKNOWLEDGMENT_PATTERNS = 
-  /^(了解|おけ|OK|ok|ありがと(う)?|あざす|サンキュー|thx|thanks|okay)[!！。\.]*$/
+const ACKNOWLEDGMENT_PATTERNS = {
+  // 感謝系(反応必須)
+  gratitude: /^(ありがと(う)?|あざす|サンキュー|thx|thanks)[!!。\.]*$/,
+  // 承認系(軽く)
+  acknowledgment: /^(了解|おけ|OK|ok|okay|オッケー|おっけー)[!!。\.]*$/,
+  // 相槌系
+  nod: /^(うん|はい|yes|ええ)[!!。\.]*$/,
+}
+
+function detectAcknowledgment(text: string): 'gratitude' | 'acknowledgment' | 'nod' | null {
+  const trimmed = text.trim()
+  if (ACKNOWLEDGMENT_PATTERNS.gratitude.test(trimmed)) return 'gratitude'
+  if (ACKNOWLEDGMENT_PATTERNS.acknowledgment.test(trimmed)) return 'acknowledgment'
+  if (ACKNOWLEDGMENT_PATTERNS.nod.test(trimmed)) return 'nod'
+  return null
+}
+
+// ============================================================
+// v1.7.0: 仮予定システム用パターン
+// ============================================================
+// 曖昧な題目(誰と/何のが不明)
+const VAGUE_TOPICS = /^(会議|ミーティング|打ち合わせ|MTG|mtg|アポ|予定|meeting|Meeting)$/
+
+// 「同じ / 違う」選択パターン(重複確認への回答)
+const CONFLICT_SAME_PATTERNS = /^(同じ|それ|同じの|同じだ|同じです|それです|それね|一緒)/
+const CONFLICT_DIFFERENT_PATTERNS = /^(違う|別|違います|別件|別のやつ|違うやつ|別物|違います)/
 
 const TARGET_TABLE_KEYWORDS = {
   memo: /(メモ|覚え書き|記録|ノート)/,
@@ -1092,6 +1120,124 @@ async function saveDecision(sourceMessage: string, intent: Intent, parsed: any, 
 }
 
 
+
+// ============================================================
+// v1.7.0: 仮予定システム - 重複検出と解決
+// ============================================================
+
+/**
+ * 同時間帯の既存予定を検出
+ * @param datetime ISO文字列
+ * @param windowMinutes 前後の許容範囲(分)
+ */
+async function checkConflictingEvents(
+  datetime: string,
+  windowMinutes: number = 60
+): Promise<any[]> {
+  try {
+    const target = new Date(datetime)
+    const windowStart = new Date(target.getTime() - windowMinutes * 60 * 1000)
+    const windowEnd = new Date(target.getTime() + windowMinutes * 60 * 1000)
+
+    const { data } = await supabase
+      .from('calendar')
+      .select('*')
+      .is('deleted_at', null)
+      .neq('state', 'cancelled')
+      .gte('datetime', windowStart.toISOString())
+      .lte('datetime', windowEnd.toISOString())
+      .order('datetime', { ascending: true })
+
+    return data || []
+  } catch (e) {
+    console.log('❌ checkConflictingEvents エラー:', e)
+    return []
+  }
+}
+
+/**
+ * 予定の不足情報を判定
+ */
+function detectMissingFields(
+  title: string,
+  peopleName: string | null | undefined
+): string[] {
+  const missingFields: string[] = []
+  if (!peopleName) missingFields.push('people')
+  if (VAGUE_TOPICS.test(title.trim())) missingFields.push('topic')
+  return missingFields
+}
+
+/**
+ * 直近の calendar_conflict pending を取得
+ */
+async function fetchLatestCalendarConflict(): Promise<any | null> {
+  try {
+    const { data } = await supabase
+      .from('pending_confirmation')
+      .select('*')
+      .eq('action', 'resolve_calendar_conflict')
+      .eq('status', 'pending')
+      .gte('expires_at', new Date().toISOString())
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle()
+    return data ?? null
+  } catch (e) {
+    console.log('❌ fetchLatestCalendarConflict エラー:', e)
+    return null
+  }
+}
+
+/**
+ * 仮予定を確定(missing_fields を埋める)
+ */
+async function confirmTentativeCalendar(
+  existingId: string,
+  newTitle: string,
+  newPeopleName: string | null | undefined
+): Promise<void> {
+  try {
+    const { data: current } = await supabase
+      .from('calendar')
+      .select('missing_fields, title')
+      .eq('id', existingId)
+      .single()
+
+    if (!current) return
+
+    const updates: any = {
+      updated_at: new Date().toISOString(),
+    }
+
+    // title を更新(新しい方が具体的)
+    if (newTitle && !VAGUE_TOPICS.test(newTitle.trim())) {
+      updates.title = newTitle
+    }
+
+    // missing_fields から該当を削除
+    let remaining: string[] = current.missing_fields || []
+    if (newPeopleName) {
+      remaining = remaining.filter((f: string) => f !== 'people')
+    }
+    if (newTitle && !VAGUE_TOPICS.test(newTitle.trim())) {
+      remaining = remaining.filter((f: string) => f !== 'topic')
+    }
+
+    if (remaining.length === 0) {
+      updates.is_tentative = false
+      updates.missing_fields = null
+    } else {
+      updates.missing_fields = remaining
+    }
+
+    await supabase.from('calendar').update(updates).eq('id', existingId)
+    console.log('✅ [v1.7.0] 仮予定を確定:', existingId, updates)
+  } catch (e) {
+    console.log('❌ confirmTentativeCalendar エラー:', e)
+  }
+}
+
 // ============================================================
 // v1.6.4: ゴミ値排除ヘルパー(LLM幻覚対策・層2)
 // 「(省略可)」「null」「なし」等のメタ値がDBに流入するのを防ぐ
@@ -1175,19 +1321,91 @@ async function saveStructuredMemory(save: any, rawText: string, userMessageId: s
   const cleanCalendar = cleanSaveValue(save.calendar)
   if (cleanCalendar) {
     const extracted = extractDatetime(rawText)
-    const { data: inserted } = await supabase
-      .from('calendar')
-      .insert({
-        title: cleanCalendar,
-        datetime: extracted?.datetime || null,
-        state: 'scheduled',
-        is_user_confirmed: true,
-        confidence: 0.9,
-      })
-      .select('id')
-      .single()
-    if (inserted) {
-      extractedEntities.push({ table: 'calendar', id: inserted.id, role: 'event' })
+    const peopleName = save.people?.name ? normalizeName(save.people.name) : null
+
+    // v1.7.0: 仮予定判定
+    const missingFields = detectMissingFields(cleanCalendar, peopleName)
+    const isTentative = missingFields.length > 0
+
+    // v1.7.0: 重複検出(datetime がある場合のみ)
+    let conflictDetected = false
+    if (extracted?.datetime) {
+      const conflicts = await checkConflictingEvents(extracted.datetime, 60)
+
+      if (conflicts.length > 0) {
+        // 既存予定と重複 → pending_confirmation に登録してユーザー判断を仰ぐ
+        const conflict = conflicts[0]
+        const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString() // 10分有効
+
+        const { error: pcError } = await supabase.from('pending_confirmation').insert({
+          user_message_id: userMessageId,
+          session_date: getSessionDate(),
+          action: 'resolve_calendar_conflict',
+          target_table: 'calendar',
+          candidates: {
+            existing: {
+              id: conflict.id,
+              title: conflict.title,
+              datetime: conflict.datetime,
+              is_tentative: conflict.is_tentative || false,
+              missing_fields: conflict.missing_fields || [],
+            },
+            new_event: {
+              title: cleanCalendar,
+              datetime: extracted.datetime,
+              is_tentative: isTentative,
+              missing_fields: missingFields,
+              people_name: peopleName,
+            },
+          },
+          mutation_plan: {
+            type: 'calendar_conflict',
+            existing_id: conflict.id,
+            new_event_data: {
+              title: cleanCalendar,
+              datetime: extracted.datetime,
+              is_tentative: isTentative,
+              missing_fields: missingFields,
+              people_name: peopleName,
+            },
+          },
+          reason_text: `同時間帯に既存予定「${conflict.title}」があるため確認が必要`,
+          status: 'pending',
+          expires_at: expiresAt,
+        })
+
+        if (pcError) {
+          console.log('⚠️ [v1.7.0] pending_confirmation INSERT エラー:', pcError)
+          // 失敗したら通常INSERTにフォールバック
+        } else {
+          console.log('🔔 [v1.7.0] 予定重複検出、ユーザー確認待ち:', conflict.id)
+          conflictDetected = true
+        }
+      }
+    }
+
+    // 重複なし → 通常INSERT(仮予定 or 確定予定として)
+    if (!conflictDetected) {
+      const { data: inserted } = await supabase
+        .from('calendar')
+        .insert({
+          title: cleanCalendar,
+          datetime: extracted?.datetime || null,
+          state: 'scheduled',
+          is_tentative: isTentative,
+          missing_fields: isTentative ? missingFields : null,
+          is_user_confirmed: true,
+          confidence: 0.9,
+        })
+        .select('id')
+        .single()
+      if (inserted) {
+        extractedEntities.push({ 
+          table: 'calendar', 
+          id: inserted.id, 
+          role: isTentative ? 'tentative_event' : 'event' 
+        })
+      }
     }
   }
 
@@ -1583,11 +1801,25 @@ executionNoteの結果に従って正確に報告する。
 
 ■保存ルール(Modifyモードでは適用されない)
 ・calendar: ユーザーが日時・予定を言った時のみ
+  - ★v1.7.0: datetimeのISO文字列(例: "2026-04-20T14:00:00")をtitleとして返してはいけない
+  - titleは自然言語で具体的に(例: "会議", "田中さんとの新規案件の会議")
+  - 「誰と」や「何の会議か」が曖昧な場合は、曖昧なまま保存してOK(システムが仮予定として扱う)
+  - 仮予定の場合、replyで「詳細分かり次第教えて」「誰と/何か決まったら言って」と促すこと
 ・task: ユーザーが明確にタスクを述べた時のみ
 ・memo: 「覚えて」「メモして」と言った時のみ
 ・people: 人物について言及した時
 ・business: 明確なビジネス案がある時のみ
 ・ideas: 明確なアイデアがある時のみ
+
+■★v1.7.0: 仮予定の扱い★
+ユーザーが日時だけ言った予定(例:「明日14時に会議」)は:
+- 誰と/何の会議かが不明 → 仮予定として保存される
+- replyでは「仮予定として押さえた。詳細分かり次第教えて。」と案内する
+- 決めつけで詳細を埋めない(「田中さんかな?」と想像しない)
+
+ユーザーが情報を追加してきた時(例:「さっきの会議、田中さんね」):
+- システムが自動で仮予定と紐付けを試みる
+- ユーザーに「その時間には○○があるけど、同じもの?違うもの?」と確認させる
 
 ■優先順位
 売上 > 時間 > 人間関係
@@ -1711,12 +1943,167 @@ export async function POST(req: NextRequest) {
     })
   }
 
-// ============================================================
+  // ============================================================
+  // v1.7.0: 予定重複の「同じ/違う」選択処理
+  // ============================================================
+  const calendarConflict = await fetchLatestCalendarConflict()
+  if (calendarConflict) {
+    const isSame = CONFLICT_SAME_PATTERNS.test(lastUserMessage.trim())
+    const isDifferent = CONFLICT_DIFFERENT_PATTERNS.test(lastUserMessage.trim())
+
+    if (isSame || isDifferent) {
+      const plan = calendarConflict.mutation_plan as any
+      const { existing_id, new_event_data } = plan
+
+      if (isSame) {
+        // 既存仮予定を確定(title/people/missing_fields更新)
+        await confirmTentativeCalendar(
+          existing_id,
+          new_event_data.title,
+          new_event_data.people_name
+        )
+
+        // people が新規提供されていれば people テーブルに記録
+        if (new_event_data.people_name) {
+          const { data: existingPerson } = await supabase
+            .from('people')
+            .select('id')
+            .eq('name', new_event_data.people_name)
+            .limit(1)
+            .maybeSingle()
+
+          if (!existingPerson) {
+            await supabase.from('people').insert({
+              name: new_event_data.people_name,
+              importance: 'B',
+            })
+          }
+        }
+
+        // pending を resolved に
+        await supabase
+          .from('pending_confirmation')
+          .update({ status: 'resolved', confirmed_at: new Date().toISOString() })
+          .eq('id', calendarConflict.id)
+
+        const replyTitle = new_event_data.title || '予定'
+        const whoPart = new_event_data.people_name 
+          ? `${new_event_data.people_name}との` 
+          : ''
+        const reply = `${whoPart}${replyTitle}として確定した。`
+
+        await supabase.from('talk_master').insert({
+          role: 'user',
+          content: lastUserMessage,
+          intent: 'modify',
+          importance: 'B',
+          session_date: sessionDate,
+        })
+        await supabase.from('talk_master').insert({
+          role: 'noida',
+          content: reply,
+          intent: 'modify',
+          importance: 'B',
+          session_date: sessionDate,
+        })
+
+        return NextResponse.json({
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              reply,
+              options: [],
+              mode: 'modify',
+              save: {},
+              decision_log: { should_log: true, decision_text: `予定「${replyTitle}」を確定した` },
+            }),
+          }],
+        })
+      }
+
+      if (isDifferent) {
+        // 別件として新規INSERT
+        const { data: inserted } = await supabase
+          .from('calendar')
+          .insert({
+            title: new_event_data.title,
+            datetime: new_event_data.datetime,
+            state: 'scheduled',
+            is_tentative: new_event_data.is_tentative,
+            missing_fields: new_event_data.is_tentative ? new_event_data.missing_fields : null,
+            is_user_confirmed: true,
+            confidence: 0.9,
+          })
+          .select('id')
+          .single()
+
+        // people 処理
+        if (new_event_data.people_name && inserted) {
+          const { data: existingPerson } = await supabase
+            .from('people')
+            .select('id')
+            .eq('name', new_event_data.people_name)
+            .limit(1)
+            .maybeSingle()
+
+          if (!existingPerson) {
+            await supabase.from('people').insert({
+              name: new_event_data.people_name,
+              importance: 'B',
+            })
+          }
+        }
+
+        await supabase
+          .from('pending_confirmation')
+          .update({ status: 'resolved', confirmed_at: new Date().toISOString() })
+          .eq('id', calendarConflict.id)
+
+        const whoPart = new_event_data.people_name 
+          ? `${new_event_data.people_name}との` 
+          : ''
+        const tentativeLabel = new_event_data.is_tentative ? '【仮】' : ''
+        const reply = `別件として${tentativeLabel}${whoPart}${new_event_data.title}を追加した。`
+
+        await supabase.from('talk_master').insert({
+          role: 'user',
+          content: lastUserMessage,
+          intent: 'execute',
+          importance: 'B',
+          session_date: sessionDate,
+        })
+        await supabase.from('talk_master').insert({
+          role: 'noida',
+          content: reply,
+          intent: 'execute',
+          importance: 'B',
+          session_date: sessionDate,
+        })
+
+        return NextResponse.json({
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              reply,
+              options: [],
+              mode: 'execute',
+              save: {},
+              decision_log: { should_log: true, decision_text: '別予定として追加した' },
+            }),
+          }],
+        })
+      }
+    }
+  }
+
+  // ============================================================
   // v1.6.5: 受諾ワード → 能動応答(State 2 秘書哲学)
   // ============================================================
-  if (ACKNOWLEDGMENT_PATTERNS.test(lastUserMessage.trim())) {
-    console.log('[v1.6.5 State2] 受諾ワード検出:', lastUserMessage.trim())
-    
+  const ackType = detectAcknowledgment(lastUserMessage)
+  if (ackType) {
+    console.log('[v1.6.5 State2] 受諾ワード検出:', ackType, lastUserMessage.trim())
+
+    // 残タスク検索
     const { data: pendingTasks } = await supabase
       .from('task')
       .select('content, importance')
@@ -1727,38 +2114,60 @@ export async function POST(req: NextRequest) {
       .order('importance', { ascending: true })
       .order('created_at', { ascending: true })
       .limit(1)
-    
+
+    // 今から先の予定
     const nowISO = new Date().toISOString()
     const { data: upcomingEvents } = await supabase
       .from('calendar')
-      .select('title, datetime')
+      .select('title, datetime, is_tentative, missing_fields')
       .is('deleted_at', null)
       .neq('state', 'cancelled')
       .gte('datetime', nowISO)
       .order('datetime', { ascending: true })
       .limit(1)
-    
-    let reply: string
-    
+
+    // 反応プレフィックス選択
+    const prefixMap: Record<string, string[]> = {
+      gratitude: ['どういたしまして。', 'お役に立てて何より。'],
+      acknowledgment: [''],
+      nod: [''],
+    }
+    const prefixes = prefixMap[ackType]
+    const prefix = prefixes[Math.floor(Math.random() * prefixes.length)]
+
+    let coreMsg: string
+
     if (pendingTasks?.length) {
-      reply = `次「${pendingTasks[0].content}」やろう。`
+      coreMsg = `次「${pendingTasks[0].content}」やろう。`
     } else if (upcomingEvents?.length) {
-      const dt = new Date(upcomingEvents[0].datetime)
+      const ev = upcomingEvents[0]
+      const dt = new Date(ev.datetime)
       const today = new Date()
       const isToday = dt.toDateString() === today.toDateString()
-      const timeStr = dt.toLocaleTimeString('ja-JP', { 
-        hour: '2-digit', 
+      const timeStr = dt.toLocaleTimeString('ja-JP', {
+        hour: '2-digit',
         minute: '2-digit',
-        hour12: false
+        hour12: false,
       })
-      const dateStr = isToday 
+      const dateStr = isToday
         ? `今日${timeStr}`
         : `${dt.getMonth() + 1}月${dt.getDate()}日${timeStr}`
-      reply = `${dateStr}に「${upcomingEvents[0].title}」があるよ。`
+      const tentativeLabel = ev.is_tentative ? '【仮】' : ''
+      coreMsg = `${dateStr}に${tentativeLabel}「${ev.title}」があるよ。`
+
+      // 仮予定なら不足情報も促す
+      if (ev.is_tentative && ev.missing_fields?.length) {
+        const asks: string[] = []
+        if (ev.missing_fields.includes('people')) asks.push('誰と')
+        if (ev.missing_fields.includes('topic')) asks.push('何の')
+        coreMsg += ` ${asks.join('/')}か分かったら教えて。`
+      }
     } else {
-      reply = '他に何かある?'
+      coreMsg = '他に何かある?'
     }
-    
+
+    const reply = prefix + coreMsg
+
     await supabase.from('talk_master').insert({
       role: 'user',
       content: lastUserMessage,
@@ -1766,7 +2175,6 @@ export async function POST(req: NextRequest) {
       importance: 'C',
       session_date: sessionDate,
     })
-    
     await supabase.from('talk_master').insert({
       role: 'noida',
       content: reply,
@@ -1774,7 +2182,7 @@ export async function POST(req: NextRequest) {
       importance: 'C',
       session_date: sessionDate,
     })
-    
+
     return NextResponse.json({
       content: [{
         type: 'text',
@@ -1788,7 +2196,7 @@ export async function POST(req: NextRequest) {
       }],
     })
   }
-  
+
   const crisisType = detectCrisis(lastUserMessage)
   const nonInterventionType = detectNonIntervention(lastUserMessage)
   const topicSwitched = detectTopicSwitch(lastUserMessage)
