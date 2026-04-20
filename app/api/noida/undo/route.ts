@@ -5,28 +5,22 @@ import { createClient } from '@supabase/supabase-js'
  * POST /api/noida/undo
  * 
  * 削除されたレコードを復元する。
- * 
- * リクエスト形式:
- *   { source_table, source_id } - 特定レコードを復元
- *   {}                          - 直近の削除を自動復元
- * 
- * 動作:
- *   1. trash_queue から対象取得
- *   2. 元テーブルに復元(memo/ideas は INSERT、task/calendar は deleted_at=null)
- *   3. trash_queue から削除
- *   4. mutation_event_log に undo エントリ追加
- * 
- * レスポンス:
- *   {
- *     success: boolean,
- *     restored: { table, id, title } | null,
- *     message: string
- *   }
+ * v2.1.x: Service Role Key 対応 + trash_queue 実カラム(deleted_at / restored)対応
  */
+
+const SUPABASE_KEY =
+  process.env.SUPABASE_SERVICE_ROLE_KEY ||
+  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
 
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
-  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
+  SUPABASE_KEY,
+  {
+    auth: {
+      autoRefreshToken: false,
+      persistSession: false,
+    },
+  }
 )
 
 export async function POST(req: NextRequest) {
@@ -43,16 +37,15 @@ export async function POST(req: NextRequest) {
   console.log('🔄 [UNDO] リクエスト:', { source_table, source_id })
 
   try {
-    // Step 1: trash_queue から対象取得
     let trashRecord: any = null
     if (source_table && source_id) {
-      // 特定指定モード
       const { data, error } = await supabase
         .from('trash_queue')
         .select('*')
         .eq('source_table', source_table)
         .eq('source_id', source_id)
-        .order('created_at', { ascending: false })
+        .eq('restored', false)
+        .order('deleted_at', { ascending: false })
         .limit(1)
         .maybeSingle()
       if (error) {
@@ -65,11 +58,11 @@ export async function POST(req: NextRequest) {
       }
       trashRecord = data
     } else {
-      // 直近モード
       const { data, error } = await supabase
         .from('trash_queue')
         .select('*')
-        .order('created_at', { ascending: false })
+        .eq('restored', false)
+        .order('deleted_at', { ascending: false })
         .limit(1)
         .maybeSingle()
       if (error) {
@@ -100,18 +93,16 @@ export async function POST(req: NextRequest) {
 
     console.log('🔍 [UNDO] 対象:', { restoreTable, restoreId, trashId })
 
-    // Step 2: 元テーブルに復元
     let restoredTitle = ''
     let restoreError: any = null
 
     if (restoreTable === 'memo' || restoreTable === 'ideas') {
-      // 物理削除だったので INSERT で復活
       const { id, created_at, updated_at, ...dataWithoutMeta } = original_data
       const { data: restored, error } = await supabase
         .from(restoreTable)
         .insert({
           ...dataWithoutMeta,
-          id: restoreId, // 元の id を保持
+          id: restoreId,
         })
         .select()
         .single()
@@ -120,35 +111,27 @@ export async function POST(req: NextRequest) {
         restoreError = error
       } else {
         restoredTitle = restored?.content?.substring(0, 50) || '(復元)'
-        console.log(`✅ [UNDO] ${restoreTable} 復活:`, restoreId)
       }
     } else if (restoreTable === 'task' || restoreTable === 'calendar') {
-      // 論理削除だったので deleted_at を null に戻す
       const updates: any = {
         deleted_at: null,
         updated_at: new Date().toISOString(),
       }
-      // task/calendar が state を持つ場合は元に戻す
-      if (original_data.state && original_data.state !== 'cancelled') {
-        updates.state = original_data.state
-      } else if (original_data.state === 'cancelled') {
-        updates.state = 'scheduled' // calendar
-      }
       if (restoreTable === 'task') {
-        updates.done = original_data.done ?? false
+        updates.state = 'active'
+        updates.done = false
         updates.completed_at = null
         updates.cancelled_at = null
       } else {
+        updates.state = 'scheduled'
         updates.cancelled_at = null
       }
-
       const { data: restored, error } = await supabase
         .from(restoreTable)
         .update(updates)
         .eq('id', restoreId)
         .select()
         .single()
-
       if (error) {
         console.error(`❌ [UNDO] ${restoreTable} UPDATE エラー:`, error)
         restoreError = error
@@ -157,7 +140,6 @@ export async function POST(req: NextRequest) {
           restored?.title?.substring(0, 50) ||
           restored?.content?.substring(0, 50) ||
           '(復元)'
-        console.log(`✅ [UNDO] ${restoreTable} 復活:`, restoreId)
       }
     } else {
       return NextResponse.json({
@@ -175,18 +157,13 @@ export async function POST(req: NextRequest) {
       }, { status: 500 })
     }
 
-    // Step 3: trash_queue から削除
-    const { error: trashDelErr } = await supabase
+    // trash_queue は物理削除じゃなく restored=true で履歴保持
+    await supabase
       .from('trash_queue')
-      .delete()
+      .update({ restored: true, restored_at: new Date().toISOString() })
       .eq('id', trashId)
-    if (trashDelErr) {
-      console.error('⚠️ [UNDO] trash_queue 削除エラー:', trashDelErr)
-      // 復元自体は成功してるので続行
-    }
 
-    // Step 4: mutation_event_log に undo エントリ追加
-    const { error: logErr } = await supabase.from('mutation_event_log').insert({
+    await supabase.from('mutation_event_log').insert({
       user_message_id: `undo_${Date.now()}`,
       event_type: 'restore',
       source_table: restoreTable,
@@ -205,9 +182,6 @@ export async function POST(req: NextRequest) {
       mutation_mode: 'confirmed',
       idempotency_key: `undo_${trashId}_${Date.now()}`,
     })
-    if (logErr) {
-      console.warn('⚠️ [UNDO] mutation_event_log エラー(無視):', logErr)
-    }
 
     const elapsedMs = Date.now() - startedAt
     console.log('🏁 [UNDO] 完了:', { restoreTable, restoreId, elapsedMs })
