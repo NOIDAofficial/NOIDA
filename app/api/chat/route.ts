@@ -924,7 +924,11 @@ async function performPreLLMAnalysis(
     const cleaned = text
       .replace(/明日|今日|明後日|来週|今週|昨日/g, '')
       .replace(/(月|火|水|木|金|土|日)曜/g, '')
-      .replace(/\d{1,2}時(\d{1,2})?分?/g, '')
+      // ★v2.1.6 Bug P 完全修正: 「時半」「:」も除去(長いパターン先)
+      .replace(/\d{1,2}時\d{1,2}分?/g, '')
+      .replace(/\d{1,2}時半/g, '')
+      .replace(/\d{1,2}時/g, '')
+      .replace(/\d{1,2}:\d{2}/g, '')
       .replace(/\d{1,2}月\d{1,2}日/g, '')
       .replace(/仮で|一旦|とりあえず|暫定/g, '')
       .replace(/の予定|予定|入れて|追加して|追加|入れといて|記録して/g, '')
