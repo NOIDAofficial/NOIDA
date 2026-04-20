@@ -744,6 +744,39 @@ function decideTentative(
   return true
 }
 
+/**
+ * ★v2.1.3 Bug N: 2つの title が類似してるか判定
+ * - 完全一致 → true
+ * - 片方がもう片方を含む(2文字以上) → true
+ * - 共通する 2+ 文字の部分文字列あり → true
+ * - それ以外 → false(別物と判定)
+ */
+function isTitleSimilar(titleA: string, titleB: string): boolean {
+  if (!titleA || !titleB) return false
+  const a = titleA.trim().toLowerCase()
+  const b = titleB.trim().toLowerCase()
+  if (!a || !b) return false
+  
+  // 完全一致
+  if (a === b) return true
+  
+  // 片方がもう片方を含む(短い方が2文字以上の時のみ)
+  if (a.length >= 2 && b.includes(a)) return true
+  if (b.length >= 2 && a.includes(b)) return true
+  
+  // 2+ 文字の共通部分文字列
+  // 短い方の各2文字 n-gram が長い方に含まれてるかチェック
+  const shorter = a.length <= b.length ? a : b
+  const longer = a.length <= b.length ? b : a
+  if (shorter.length < 2) return false
+  for (let i = 0; i <= shorter.length - 2; i++) {
+    const bigram = shorter.substring(i, i + 2)
+    if (longer.includes(bigram)) return true
+  }
+  
+  return false
+}
+
 async function checkConflictingEventsForPreLLM(
   datetime: string | null,
   extractedTitle: string | null,
@@ -771,12 +804,29 @@ async function checkConflictingEventsForPreLLM(
       if (error) console.error('❌ [preLLM] checkConflict エラー:', error)
       
       const events = data || []
-      if (events.length > 0) {
+      // ★v2.1.3 Bug N 修正: 時刻が近くても title 類似性がなければ conflict じゃない
+      //   「ジム」と「定例打ち合わせ」は別物なので「同じ?別件?」と聞く意味がない
+      const similarEvents = extractedTitle && extractedTitle.length >= 2
+        ? events.filter((e: any) => isTitleSimilar(extractedTitle, e.title || ''))
+        : events
+      
+      if (similarEvents.length > 0) {
+        console.log('⚠️ [preLLM Bug N] conflict 検出(類似 title):', {
+          new_title: extractedTitle,
+          matched: similarEvents.map((e: any) => e.title),
+          filtered_from: events.length,
+        })
         return {
           has_conflict: true,
-          existing_events: events,
-          window_description: `${windowMinutes}分以内の同時刻帯`,
+          existing_events: similarEvents,
+          window_description: `${windowMinutes}分以内の同時刻帯(類似タイトル)`,
         }
+      }
+      if (events.length > 0 && similarEvents.length === 0) {
+        console.log('🟢 [preLLM Bug N] 時刻重複あるが title 違うので conflict なし:', {
+          new_title: extractedTitle,
+          nearby_titles: events.map((e: any) => e.title),
+        })
       }
     } catch (e) {
       console.error('❌ [preLLM] checkConflict 例外:', e)
