@@ -945,6 +945,26 @@ async function performPreLLMAnalysis(
     signals.has_appointment_context ||
     (!!extractedTitle && !VAGUE_TOPICS.test(extractedTitle))
   
+  // ★v2.1.7 DEBUG: extractedTitle の実体を徹底追跡
+  const codesOf = (s: string | null): string[] | null => {
+    if (!s) return null
+    const codes: string[] = []
+    for (let i = 0; i < s.length; i++) {
+      codes.push(s.charCodeAt(i).toString(16))
+    }
+    return codes
+  }
+  console.log('🐛 [v2.1.7 TITLE DEBUG]', {
+    raw_text: text,
+    raw_text_json: JSON.stringify(text),
+    raw_text_codes: codesOf(text)?.slice(0, 20),
+    extractedTitle,
+    extractedTitle_json: JSON.stringify(extractedTitle),
+    extractedTitle_codes: codesOf(extractedTitle),
+    vague_test: extractedTitle ? VAGUE_TOPICS.test(extractedTitle) : null,
+    hasExplicitTitle_calc: hasExplicitTitle,
+  })
+  
   const shouldDetectConflict = isCalendarAdd && hasExplicitTitle
   
   const conflictDetection = shouldDetectConflict
