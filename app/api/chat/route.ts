@@ -3336,6 +3336,51 @@ export async function POST(req: NextRequest) {
     parsed.options = ['同じ', '別件']
   }
 
+  // ============================================================
+  // ★v2.0.1 Bug I 修正: clarification 時のコード側強制ガード
+  // ============================================================
+  // LLM が clarification 指示を無視して「入れた」と過去形応答 + save 埋めてくる
+  // コード側で強制的に save を null 化、reply も書き換えることで原則14 を守る
+  const isClarificationMode = 
+    askingStrategy === 'clarification' &&
+    preLLMAnalysis.is_calendar_add &&
+    !preLLMAnalysis.conflict_detection.has_conflict &&
+    !clarificationMergedFrom
+
+  if (isClarificationMode) {
+    console.log('🛡️ [v2.0.1 GUARD] clarification mode — LLM save を強制 null 化', {
+      original_save_calendar: parsed.save?.calendar,
+      original_reply: (parsed.reply || '').substring(0, 50),
+    })
+    // save を全て null に(LLM の INSERT 暴走を止める)
+    parsed.save = {
+      memo: null,
+      calendar: null,
+      task: null,
+      people: null,
+      business: null,
+      ideas: null,
+    }
+    // reply を書き換え(原則14:DB と発話の一致)
+    const missingTitle = !preLLMAnalysis.has_explicit_title || preLLMAnalysis.has_vague_topic
+    const missingTime = !preLLMAnalysis.signals.has_explicit_time
+    if (missingTitle && missingTime) {
+      parsed.reply = '何時の何の予定?'
+    } else if (missingTitle) {
+      // 時刻は分かってる、題目だけ欠けてる
+      const dtStr = preLLMAnalysis.extracted_datetime 
+        ? new Date(preLLMAnalysis.extracted_datetime).toLocaleString('ja-JP', {
+            month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit',
+          })
+        : null
+      parsed.reply = dtStr ? `${dtStr}の何の予定?` : '何の予定?'
+    } else if (missingTime) {
+      parsed.reply = '何時?'
+    }
+    parsed.mode = 'execute'
+    parsed.options = []
+  }
+
   // ★v2.0 FSM: clarification 応答時に conversation_state 作成
   const shouldCreateClarificationState =
     askingStrategy === 'clarification' &&
