@@ -15,62 +15,21 @@ import {
 import { correctInput } from '@/lib/analyzer/inputCorrector'
 
 /**
- * NOIDA route.ts v1.9.0 (Phase 1 Day 7 - 原則14 Synchronous Truth)
+ * NOIDA route.ts v2.0.0 (Phase 1 Day 7 - Conversation FSM)
  *
  * ============================================================
- * v1.9.0 の核心変更(v1.8.0 からの差分)
+ * v2.0.0 の核心変更
  * ============================================================
  *
- * 【原則14: Synchronous Truth(同期真実性)NEW】
- *   NOIDA の発話は、その時点の DB 状態と一致していなければならない。
- *   「後で確定する」は「入れた」ではなく「確認が必要」と正直に言う。
- *   
- *   Takuma 発見(2026-04-20 Day 7 後半):
- *   「同じって、そもそも何が?ってならない?」
- *   → NOIDA は pending_confirmation 作ったことをユーザーに伝えてない
- *   → 「入れた」と嘘応答して 10 分後に「同じ」で突然確定
- *   → ユーザーは文脈を失う(原則1 違反の UX レベル版)
+ * Bug H 根治:曖昧題目 clarification の文脈継承
+ *   v1.9.1 までは clarification 後の短い回答(例:「会議」)で
+ *   datetime NULL の calendar INSERT が発生する不具合があった。
  *
- * 【v1.9.0 の実装(9項目)】
+ *   → conversation_state テーブルで FSM 化
+ *   → 短い回答を前ターンの文脈に merge して再処理
+ *   → 曖昧語連鎖(会議→会議)を検出して再 clarification
  *
- * 🔴 P0:
- * 1. Pre-LLM Conflict Detection
- *    - LLM 呼び出しの前に重複検出を実行
- *    - 重複あれば systemPrompt に injection
- *    - LLM は最初から「既存の〜と同じ?別件?」と聞く
- *    - options に ['同じ', '別件'] を入れる
- *
- * 2. Modify Pending Confirmation
- *    - 削除・キャンセル確認を pending_confirmation で管理
- *    - 承認返答(「削除する」「はい」「同じ」)を通常 intent より先に処理
- *
- * 3. systemPrompt 嘘防止強化(原則14)
- *    - execution_result なしで過去形応答禁止
- *    - DB 未更新なら「確認が必要」と正直に
- *
- * 4. check_status バグ修正
- *    - 'resolved' → 'confirmed' に統一
- *
- * 🟠 P1:
- * 5. Bug A 修正: hasTitleOrTopic を AskingStrategy で使う
- * 6. Bug F 修正: systemPrompt に people.note 保存許可
- * 7. save.people 形式ブレ対応(string / object)
- * 8. confirmTentativeCalendar に人物紐付け
- * 9. calendar INSERT 時に person_id 設定
- *
- * ============================================================
- * 既存の設計原則(継承)
- * ============================================================
- * 原則1: DB真実(Database Truth)
- * 原則2: Execute-First Design
- * 原則3: Fail-Safe(安全優先)
- * 原則4: 全シグナル活用
- * 原則5: 誤字許容 × 学習
- * 原則10: シリコンバレー大手クオリティ
- * 原則11: 二層の正しさ(Dual Correctness)
- * 原則12: 最小干渉(Minimal Intrusion)
- * 原則13: 必要知(Necessary Knowledge)
- * 原則14: 同期真実性(Synchronous Truth)— NEW
+ * 継承:v1.9.0 Synchronous Truth / v1.9.1 Bug G 根治
  */
 
 const supabase = createClient(
@@ -184,7 +143,6 @@ type SaveEntityResult = {
   skipped_reason?: string
 }
 
-// ★v1.8.0 継承: Event Signals
 type EventSignals = {
   has_explicit_person: boolean
   has_explicit_location: boolean
@@ -206,17 +164,15 @@ type EventCategory =
   | 'sensitive'
   | 'unknown'
 
-// ★v1.8.0 継承: Asking Strategy
 type AskingStrategy =
   | 'silent'
   | 'optional_hint'
   | 'clarification'
   | 'disambiguation'
 
-// ★v1.9.0 NEW: Pre-LLM Analysis Result
 type PreLLMAnalysis = {
   intent_hint: Intent | null
-  is_calendar_add: boolean  // 予定追加っぽいか
+  is_calendar_add: boolean
   extracted_title: string | null
   extracted_datetime: string | null
   conflict_detection: {
@@ -225,20 +181,19 @@ type PreLLMAnalysis = {
     window_description: string
   }
   modify_action: ModifyAction | null
-  has_explicit_title: boolean  // ★v1.9.0 Bug A: 明示的なタイトルか
-  has_vague_topic: boolean     // 「打ち合わせ」「会議」など曖昧語
+  has_explicit_title: boolean
+  has_vague_topic: boolean
   signals: EventSignals
   inferred_category: EventCategory
 }
 
-// ★v1.9.0 NEW: Reply Type Detection
 type ReplyType =
-  | 'conflict_same'       // 重複確認: 同じ
-  | 'conflict_different'  // 重複確認: 違う
-  | 'modify_approve'      // modify 確認: はい/実行
-  | 'modify_reject'       // modify 確認: いいえ/やめる
-  | 'candidate_select'    // 複数候補から選択
-  | 'unrelated'           // 関連なし(通常処理へ)
+  | 'conflict_same'
+  | 'conflict_different'
+  | 'modify_approve'
+  | 'modify_reject'
+  | 'candidate_select'
+  | 'unrelated'
 
 // ============================================================
 // パターン定義
@@ -289,10 +244,110 @@ function detectAcknowledgment(text: string): 'gratitude' | 'acknowledgment' | 'n
 }
 
 const VAGUE_TOPICS = /^(会議|ミーティング|打ち合わせ|MTG|mtg|アポ|予定|meeting|Meeting|用事|タスク|やること)$/
-// ★v1.9.0 Bug A: 部分一致用(入力文中に含まれてるか)
 const VAGUE_TOPICS_CONTAINS = /(会議|ミーティング|打ち合わせ|MTG|mtg|アポ|予定|用事)/
 
-// ★v1.9.0: Reply Type Patterns(拡張)
+// ============================================================
+// ★v2.0.0 NEW: Conversation FSM
+// ============================================================
+
+async function fetchActiveConversationState(sessionDate: string): Promise<any | null> {
+  try {
+    const { data, error } = await supabase
+      .from('conversation_state')
+      .select('*')
+      .eq('status', 'active')
+      .eq('session_date', sessionDate)
+      .gte('expires_at', new Date().toISOString())
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle()
+    if (error) console.error('❌ [v2.0] conversation_state 取得エラー:', error)
+    return data ?? null
+  } catch (e) {
+    console.error('❌ [v2.0] fetchActiveConversationState 例外:', e)
+    return null
+  }
+}
+
+async function createClarificationState(
+  partialData: any,
+  target: 'title' | 'datetime' | 'both' | 'vague_answer_retry',
+  userMessageId: string,
+  noidaMessageId: string | null = null
+): Promise<string | null> {
+  const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString()
+  const { data, error } = await supabase
+    .from('conversation_state')
+    .insert({
+      session_date: getSessionDate(),
+      state: 'awaiting_clarification',
+      partial_data: partialData,
+      clarification_target: target,
+      source_user_message_id: userMessageId,
+      source_noida_message_id: noidaMessageId,
+      expires_at: expiresAt,
+      status: 'active',
+    })
+    .select('id')
+    .single()
+  if (error) {
+    console.error('❌ [v2.0] conversation_state INSERT エラー:', error)
+    return null
+  }
+  console.log('🆕 [v2.0 FSM] clarification state 作成:', data?.id, 'target:', target)
+  return data?.id ?? null
+}
+
+async function resolveConversationState(
+  id: string,
+  newStatus: 'resolved' | 'expired'
+): Promise<void> {
+  const { error } = await supabase
+    .from('conversation_state')
+    .update({ status: newStatus })
+    .eq('id', id)
+  if (error) {
+    console.error(`❌ [v2.0] conversation_state UPDATE(${newStatus}) エラー:`, error)
+  } else {
+    console.log(`✅ [v2.0 FSM] state ${id} → ${newStatus}`)
+  }
+}
+
+function userTalkIdOrFallback(id: string | null | undefined): string {
+  return id || `msg_${Date.now()}`
+}
+
+function mergeClarificationContext(
+  original: string,
+  answer: string,
+  target: 'title' | 'datetime' | 'both' | 'vague_answer_retry' | null
+): { merged: string; is_vague_answer: boolean } {
+  const answerTrimmed = answer.trim()
+  const isVagueAnswer = VAGUE_TOPICS.test(answerTrimmed)
+
+  if (target === 'title' || target === 'vague_answer_retry') {
+    const replaced = original.replace(VAGUE_TOPICS_CONTAINS, answerTrimmed).trim()
+    const merged = replaced !== original ? replaced : `${original} ${answerTrimmed}`.trim()
+    return { merged, is_vague_answer: isVagueAnswer }
+  }
+
+  if (target === 'datetime') {
+    return { 
+      merged: `${answerTrimmed} ${original}`.trim(),
+      is_vague_answer: isVagueAnswer,
+    }
+  }
+
+  if (target === 'both') {
+    return {
+      merged: `${original} ${answerTrimmed}`.trim(),
+      is_vague_answer: isVagueAnswer,
+    }
+  }
+
+  return { merged: `${original} ${answerTrimmed}`.trim(), is_vague_answer: isVagueAnswer }
+}
+
 const REPLY_PATTERNS = {
   conflict_same: /^(同じ|それ|同じの|同じだ|同じです|それです|それね|一緒|そう|そうそう|はい同じ|そう同じ)$/,
   conflict_different: /^(違う|別|違います|別件|別のやつ|違うやつ|別物|別だ|違うよ|別件で|別に追加)$/,
@@ -319,22 +374,19 @@ const SIGNAL_PATTERNS = {
 }
 
 // ============================================================
-// ユーティリティ関数
+// ユーティリティ
 // ============================================================
 
 function normalizeName(name: string) {
   return name.replace(/[さん様社長会長部長課長先生]/g, '').trim()
 }
 
-// ★v1.9.0 Bug 3 修正: 「14時に田中さん」→「時に田中」の誤抽出対策
 function extractKeywords(text: string) {
-  // 数字・助詞「時」「に」の後ろを除外
   const people: string[] = []
   const personRegex = /([一-龯ぁ-んァ-ンA-Za-z]{2,12})(さん|会長|社長|部長|課長|先生|様)/g
   let match: RegExpExecArray | null
   while ((match = personRegex.exec(text)) !== null) {
     const name = match[1]
-    // 「時に田中」「分に佐藤」のような、助詞・数詞で終わる prefix を除去
     const cleaned = name
       .replace(/^.*時に/, '')
       .replace(/^.*分に/, '')
@@ -460,10 +512,6 @@ function extractDatetime(text: string): { title: string; datetime: string | null
   return null
 }
 
-// ============================================================
-// 検知関数
-// ============================================================
-
 function detectCrisis(text: string): 'lethal' | 'destructive' | 'illegal' | null {
   if (CRISIS_PATTERNS.lethal.test(text)) return 'lethal'
   if (CRISIS_PATTERNS.destructive.test(text)) return 'destructive'
@@ -538,9 +586,6 @@ function detectPreviousEmpathy(messages: any[]): boolean {
   }
 }
 
-// ============================================================
-// ★v1.9.0 NEW: Reply Type Detection(承認返答の分類)
-// ============================================================
 function detectReplyType(text: string): ReplyType {
   const trimmed = text.trim()
   if (REPLY_PATTERNS.conflict_same.test(trimmed)) return 'conflict_same'
@@ -550,9 +595,6 @@ function detectReplyType(text: string): ReplyType {
   return 'unrelated'
 }
 
-// ============================================================
-// ★v1.8.0 継承: Event Signals 抽出
-// ============================================================
 function extractEventSignals(text: string): EventSignals {
   return {
     has_explicit_person: SIGNAL_PATTERNS.explicit_person.test(text),
@@ -576,9 +618,6 @@ function inferEventCategory(signals: EventSignals): EventCategory {
   return 'unknown'
 }
 
-// ============================================================
-// ★v1.9.0 改良: Asking Strategy(hasTitleOrTopic を使う - Bug A 修正)
-// ============================================================
 function decideAskingStrategy(
   signals: EventSignals,
   hasTime: boolean,
@@ -586,19 +625,13 @@ function decideAskingStrategy(
   hasVagueTopic: boolean
 ): AskingStrategy {
   if (signals.is_sensitive) return 'silent'
-  
   const hasTimeOrLocation = hasTime || signals.has_explicit_location
-  
-  // 時間も場所もない → 必須情報の欠落
   if (!hasTimeOrLocation) {
     return 'clarification'
   }
-  
-  // ★v1.9.0 Bug A 修正: 時間あっても曖昧題目の場合は clarification
   if (!hasExplicitTitle && hasVagueTopic) {
     return 'clarification'
   }
-  
   return 'silent'
 }
 
@@ -612,10 +645,6 @@ function decideTentative(
   return true
 }
 
-// ============================================================
-// ★v1.9.0 NEW: Pre-LLM Conflict Detection の核心
-// ============================================================
-
 async function checkConflictingEventsForPreLLM(
   datetime: string | null,
   extractedTitle: string | null,
@@ -625,7 +654,6 @@ async function checkConflictingEventsForPreLLM(
   existing_events: any[]
   window_description: string
 }> {
-  // 時間ベースの重複検出(優先)
   if (datetime) {
     try {
       const target = new Date(datetime)
@@ -641,7 +669,7 @@ async function checkConflictingEventsForPreLLM(
         .lte('datetime', windowEnd.toISOString())
         .order('datetime', { ascending: true })
 
-      if (error) console.error('❌ [v1.9.0 preLLM] checkConflict エラー:', error)
+      if (error) console.error('❌ [preLLM] checkConflict エラー:', error)
       
       const events = data || []
       if (events.length > 0) {
@@ -652,11 +680,10 @@ async function checkConflictingEventsForPreLLM(
         }
       }
     } catch (e) {
-      console.error('❌ [v1.9.0 preLLM] checkConflict 例外:', e)
+      console.error('❌ [preLLM] checkConflict 例外:', e)
     }
   }
   
-  // タイトルベースの類似検出(時間不明時のフォールバック)
   if (extractedTitle && extractedTitle.length >= 2) {
     try {
       const todayStart = new Date()
@@ -675,7 +702,7 @@ async function checkConflictingEventsForPreLLM(
         .order('datetime', { ascending: true })
         .limit(3)
 
-      if (error) console.error('❌ [v1.9.0 preLLM] title-based checkConflict エラー:', error)
+      if (error) console.error('❌ [preLLM] title-based checkConflict エラー:', error)
 
       const events = data || []
       if (events.length > 0) {
@@ -686,7 +713,7 @@ async function checkConflictingEventsForPreLLM(
         }
       }
     } catch (e) {
-      console.error('❌ [v1.9.0 preLLM] title-based checkConflict 例外:', e)
+      console.error('❌ [preLLM] title-based checkConflict 例外:', e)
     }
   }
   
@@ -696,10 +723,6 @@ async function checkConflictingEventsForPreLLM(
     window_description: '',
   }
 }
-
-// ============================================================
-// ★v1.9.0 NEW: Pre-LLM Analysis(LLM 呼び出し前の包括的分析)
-// ============================================================
 
 async function performPreLLMAnalysis(
   text: string,
@@ -715,7 +738,6 @@ async function performPreLLMAnalysis(
   const trimmed = text.trim()
   const hasVagueTopic = VAGUE_TOPICS_CONTAINS.test(trimmed)
   
-  // カレンダー追加の意図判定
   const isCalendarAdd = 
     (intent === 'execute' || intent === 'generic' || intent === 'decide') &&
     !modifyAction &&
@@ -725,7 +747,6 @@ async function performPreLLMAnalysis(
      signals.has_solo_context ||
      hasVagueTopic)
   
-  // ★v1.9.1: タイトル抽出を先に実行(hasExplicitTitle の判定に使うため)
   let extractedTitle: string | null = null
   if (isCalendarAdd) {
     const cleaned = text
@@ -740,21 +761,14 @@ async function performPreLLMAnalysis(
     extractedTitle = cleaned.length >= 2 ? cleaned : null
   }
   
-  // ★v1.9.1 根治: hasExplicitTitle を extractedTitle ベースに
-  // (v1.9.0 の length fallback は time marker 込みで判定してたため
-  //  「明日14時に打ち合わせ」→ length=10 → explicit 誤判定 = Bug G root cause)
   const hasExplicitTitle = 
     signals.has_explicit_person ||
     signals.has_explicit_location ||
     signals.has_solo_context ||
     signals.has_family_context ||
     signals.has_appointment_context ||
-    // 抽出後のタイトルが曖昧語単体でなければ明示
     (!!extractedTitle && !VAGUE_TOPICS.test(extractedTitle))
   
-  // ★v1.9.1 根治: 曖昧題目のとき conflict 検出しない(clarification 優先)
-  // Takuma 原則14「同じって何が?」— 曖昧なまま「同じ?別件?」は不誠実
-  // タイトルが確定してから conflict 判定する方が原則14 合致
   const shouldDetectConflict = isCalendarAdd && hasExplicitTitle
   
   const conflictDetection = shouldDetectConflict
@@ -779,9 +793,6 @@ async function performPreLLMAnalysis(
   }
 }
 
-// ============================================================
-// ★v1.8.0 継承: Model Router
-// ============================================================
 function selectModel(
   intent: Intent,
   crisisType: string | null,
@@ -795,9 +806,6 @@ function selectModel(
   return 'gpt-4o-mini'
 }
 
-// ============================================================
-// ★v1.8.0 継承: Debouncing
-// ============================================================
 type RecentMutation = {
   target_id: string
   target_table: TargetTable
@@ -823,14 +831,10 @@ function shouldDebounceReport(
   return !!recent
 }
 
-// ============================================================
-// メモリ取得
-// ============================================================
-
 async function fetchOwnerMaster() {
   const { data, error } = await supabase.from('owner_master').select('*').limit(1).single()
   if (error && error.code !== 'PGRST116') {
-    console.error('❌ [v1.9.0] owner_master 取得エラー:', error)
+    console.error('❌ owner_master 取得エラー:', error)
   }
   return data ?? null
 }
@@ -849,7 +853,7 @@ async function fetchMemory(
       .ilike('name', `%${name}%`)
       .is('deleted_at', null)
       .limit(1)
-    if (error) console.error('❌ [v1.9.0] people 検索エラー:', error)
+    if (error) console.error('❌ people 検索エラー:', error)
     if (data?.length) {
       const p = data[0]
       memory.push(
@@ -865,7 +869,7 @@ async function fetchMemory(
       .select('*')
       .ilike('name', `%${name}%`)
       .limit(1)
-    if (error) console.error('❌ [v1.9.0] business_master 検索エラー:', error)
+    if (error) console.error('❌ business_master 検索エラー:', error)
     if (data?.length) {
       const b = data[0]
       memory.push(`【事業】${b.name}(${b.status || '進行中'})${b.note ? '詳細:' + b.note : ''}`)
@@ -880,7 +884,7 @@ async function fetchMemory(
       .is('deleted_at', null)
       .order('created_at', { ascending: true })
       .limit(2)
-    if (error) console.error('❌ [v1.9.0] task 検索エラー:', error)
+    if (error) console.error('❌ task 検索エラー:', error)
     if (data?.length) {
       memory.push(`【未完了タスク】${data.map((t: any) => t.content).join(' / ')}`)
     }
@@ -893,7 +897,7 @@ async function fetchMemory(
       .is('deleted_at', null)
       .order('created_at', { ascending: false })
       .limit(1)
-    if (error) console.error('❌ [v1.9.0] calendar 検索エラー:', error)
+    if (error) console.error('❌ calendar 検索エラー:', error)
     if (data?.length) {
       memory.push(`【予定】${data[0].title}`)
     }
@@ -911,7 +915,7 @@ async function fetchPendingFeedback() {
     .order('created_at', { ascending: true })
     .limit(1)
     .maybeSingle()
-  if (error) console.error('❌ [v1.9.0] feedback_queue 取得エラー:', error)
+  if (error) console.error('❌ feedback_queue 取得エラー:', error)
   return data ?? null
 }
 
@@ -920,18 +924,14 @@ async function recordFeedback(queueId: string, decisionLogId: string, done: bool
     .from('decision_log')
     .update({ action_taken: done ? 'done' : 'skipped', updated_at: new Date().toISOString() })
     .eq('id', decisionLogId)
-  if (e1) console.error('❌ [v1.9.0] decision_log 更新エラー:', e1)
+  if (e1) console.error('❌ decision_log 更新エラー:', e1)
 
   const { error: e2 } = await supabase
     .from('feedback_queue')
     .update({ asked: true, answered: true })
     .eq('id', queueId)
-  if (e2) console.error('❌ [v1.9.0] feedback_queue 更新エラー:', e2)
+  if (e2) console.error('❌ feedback_queue 更新エラー:', e2)
 }
-
-// ============================================================
-// ★v1.9.0 改良: Aliases 更新ヘルパー(Bug E 対応)
-// ============================================================
 
 async function appendAlias(
   table: TargetTable,
@@ -945,7 +945,7 @@ async function appendAlias(
       .eq('id', recordId)
       .maybeSingle<{ aliases: string[] | null }>()
     if (getErr) {
-      console.error(`❌ [v1.9.0] ${table} aliases 取得エラー:`, getErr)
+      console.error(`❌ ${table} aliases 取得エラー:`, getErr)
       return
     }
     
@@ -953,15 +953,14 @@ async function appendAlias(
     const trimmed = newAlias.trim()
     if (!trimmed || trimmed.length < 2) return
     
-    // ★v1.9.0 Bug E 対応: 削除命令文やメタ表現は alias にしない
     const garbagePatterns = [
       /消して|削除|キャンセル|取り消し|なくなった|やめ/,
       /^(あの|その|この)/,
-      /^[0-9]/,  // 数字始まりは除外
-      /時間|場所|誰と/,  // 質問ワード除外
+      /^[0-9]/,
+      /時間|場所|誰と/,
     ]
     if (garbagePatterns.some(p => p.test(trimmed))) {
-      console.log(`⚠️ [v1.9.0] alias 除外(ゴミ): "${trimmed}"`)
+      console.log(`⚠️ alias 除外(ゴミ): "${trimmed}"`)
       return
     }
     
@@ -973,17 +972,14 @@ async function appendAlias(
       .update({ aliases: updated })
       .eq('id', recordId)
     if (upErr) {
-      console.error(`❌ [v1.9.0] ${table} aliases 更新エラー:`, upErr)
+      console.error(`❌ ${table} aliases 更新エラー:`, upErr)
     } else {
-      console.log(`✅ [v1.9.0 Dual-Field] aliases 追加: ${table}.${recordId} += "${trimmed}"`)
+      console.log(`✅ aliases 追加: ${table}.${recordId} += "${trimmed}"`)
     }
   } catch (e) {
-    console.error(`❌ [v1.9.0] appendAlias 例外:`, e)
+    console.error(`❌ appendAlias 例外:`, e)
   }
 }
-// ============================================================
-// ★v1.9.0 継承: Entity Resolution 層
-// ============================================================
 
 function scoreCandidate(
   candidate: any,
@@ -1179,7 +1175,7 @@ async function resolveReference(
           .neq('state', 'cancelled')
       }
       const { data, error } = await query
-      if (error) console.error('❌ [v1.9.0] resolveReference/task エラー:', error)
+      if (error) console.error('❌ resolveReference/task エラー:', error)
       candidates = data || []
     } else if (targetTable === 'calendar') {
       let query = supabase
@@ -1192,7 +1188,7 @@ async function resolveReference(
         query = query.is('deleted_at', null)
       }
       const { data, error } = await query
-      if (error) console.error('❌ [v1.9.0] resolveReference/calendar エラー:', error)
+      if (error) console.error('❌ resolveReference/calendar エラー:', error)
       candidates = data || []
     } else if (targetTable === 'memo') {
       const { data, error } = await supabase
@@ -1200,7 +1196,7 @@ async function resolveReference(
         .select('*')
         .order('created_at', { ascending: false })
         .limit(30)
-      if (error) console.error('❌ [v1.9.0] resolveReference/memo エラー:', error)
+      if (error) console.error('❌ resolveReference/memo エラー:', error)
       candidates = data || []
     } else if (targetTable === 'ideas') {
       const { data, error } = await supabase
@@ -1208,11 +1204,11 @@ async function resolveReference(
         .select('*')
         .order('created_at', { ascending: false })
         .limit(30)
-      if (error) console.error('❌ [v1.9.0] resolveReference/ideas エラー:', error)
+      if (error) console.error('❌ resolveReference/ideas エラー:', error)
       candidates = data || []
     }
   } catch (e) {
-    console.error('❌ [v1.9.0] resolveReference 例外:', e)
+    console.error('❌ resolveReference 例外:', e)
   }
 
   if (candidates.length === 0) {
@@ -1284,7 +1280,6 @@ async function resolveReference(
     )
 
   return {
-    // ★v1.9.0 3者レビュー P0: needsConfirmation 時は target_id を null にする
     target_id: needsConfirmation ? null : (top && top.score >= 0.3 ? top.id : null),
     target_title: top && top.score >= 0.3 ? top.title : null,
     confidence,
@@ -1365,16 +1360,12 @@ async function generateMutationPlan(
   }
 }
 
-// ============================================================
-// ★v1.9.0 NEW: Modify 用 pending_confirmation 管理
-// ============================================================
-
 async function createModifyPending(
   plan: MutationPlan,
   userMessageId: string,
   userText: string
 ): Promise<string | null> {
-  const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString()  // 15分
+  const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString()
 
   const actionJpMap: Record<string, string> = {
     delete: '削除', complete: '完了', cancel: 'キャンセル',
@@ -1417,10 +1408,10 @@ async function createModifyPending(
     .single()
 
   if (error) {
-    console.error('❌ [v1.9.0] modify pending INSERT エラー:', error)
+    console.error('❌ modify pending INSERT エラー:', error)
     return null
   }
-  console.log('📌 [v1.9.0] modify pending 作成:', data?.id)
+  console.log('📌 modify pending 作成:', data?.id)
   return data?.id || null
 }
 
@@ -1435,10 +1426,10 @@ async function fetchLatestModifyPending(): Promise<any | null> {
       .order('created_at', { ascending: false })
       .limit(1)
       .maybeSingle()
-    if (error) console.error('❌ [v1.9.0] fetchLatestModifyPending エラー:', error)
+    if (error) console.error('❌ fetchLatestModifyPending エラー:', error)
     return data ?? null
   } catch (e) {
-    console.error('❌ [v1.9.0] fetchLatestModifyPending 例外:', e)
+    console.error('❌ fetchLatestModifyPending 例外:', e)
     return null
   }
 }
@@ -1455,9 +1446,9 @@ async function resolvePending(
     })
     .eq('id', pendingId)
   if (error) {
-    console.error(`❌ [v1.9.0] pending UPDATE(${newStatus}) エラー:`, error)
+    console.error(`❌ pending UPDATE(${newStatus}) エラー:`, error)
   } else {
-    console.log(`✅ [v1.9.0] pending ${pendingId} → ${newStatus}`)
+    console.log(`✅ pending ${pendingId} → ${newStatus}`)
   }
 }
 
@@ -1491,7 +1482,7 @@ async function executeMutationPlan(
       .single()
 
     if (beforeError || !before) {
-      console.error('❌ [v1.9.0] executeMutationPlan: target取得エラー', beforeError)
+      console.error('❌ executeMutationPlan: target取得エラー', beforeError)
       return {
         status: 'error',
         error: 'target_not_found_at_execution',
@@ -1499,7 +1490,6 @@ async function executeMutationPlan(
       }
     }
 
-    // aliases 蓄積(Bug E 対策済み)
     const contentField = plan.target_table === 'task' || plan.target_table === 'memo' || plan.target_table === 'ideas'
       ? 'content'
       : 'title'
@@ -1528,7 +1518,7 @@ async function executeMutationPlan(
       })
 
       if (trashError) {
-        console.error('⚠️ [v1.9.0] trash_queue INSERTエラー:', trashError)
+        console.error('⚠️ trash_queue INSERTエラー:', trashError)
       }
 
       if (plan.target_table === 'memo' || plan.target_table === 'ideas') {
@@ -1538,12 +1528,11 @@ async function executeMutationPlan(
           .eq('id', plan.target_id)
           .select('id')
         if (error) {
-          console.error('❌ [v1.9.0] delete エラー:', error)
+          console.error('❌ delete エラー:', error)
           return { status: 'error', error: error.message, action: plan.action }
         }
-        // ★v1.9.0 3者レビュー: affected_rows !== 1 ならエラー
         if (!deletedRows || deletedRows.length !== 1) {
-          console.error('❌ [v1.9.0] delete で予期しない件数:', deletedRows?.length)
+          console.error('❌ delete で予期しない件数:', deletedRows?.length)
           return { status: 'error', error: `unexpected affected rows: ${deletedRows?.length ?? 0}`, action: plan.action }
         }
       } else {
@@ -1553,11 +1542,11 @@ async function executeMutationPlan(
           .eq('id', plan.target_id)
           .select('id')
         if (error) {
-          console.error('❌ [v1.9.0] soft-delete エラー:', error)
+          console.error('❌ soft-delete エラー:', error)
           return { status: 'error', error: error.message, action: plan.action }
         }
         if (!updatedRows || updatedRows.length !== 1) {
-          console.error('❌ [v1.9.0] soft-delete で予期しない件数:', updatedRows?.length)
+          console.error('❌ soft-delete で予期しない件数:', updatedRows?.length)
           return { status: 'error', error: `unexpected affected rows: ${updatedRows?.length ?? 0}`, action: plan.action }
         }
       }
@@ -1568,11 +1557,11 @@ async function executeMutationPlan(
         .eq('id', plan.target_id)
         .select('id')
       if (error) {
-        console.error('❌ [v1.9.0] update エラー:', error)
+        console.error('❌ update エラー:', error)
         return { status: 'error', error: error.message, action: plan.action }
       }
       if (!updatedRows || updatedRows.length !== 1) {
-        console.error('❌ [v1.9.0] update で予期しない件数:', updatedRows?.length)
+        console.error('❌ update で予期しない件数:', updatedRows?.length)
         return { status: 'error', error: `unexpected affected rows: ${updatedRows?.length ?? 0}`, action: plan.action }
       }
     }
@@ -1593,7 +1582,7 @@ async function executeMutationPlan(
         version: (before.version || 1) + 1,
         effective_from: new Date().toISOString(),
       })
-      if (stError) console.error('⚠️ [v1.9.0] state_transition INSERT エラー:', stError)
+      if (stError) console.error('⚠️ state_transition INSERT エラー:', stError)
     }
 
     let after: any = null
@@ -1621,7 +1610,7 @@ async function executeMutationPlan(
       idempotency_key: plan.idempotency_key,
     })
     if (mutLogError) {
-      console.error('⚠️ [v1.9.0] mutation_event_log INSERT エラー:', mutLogError)
+      console.error('⚠️ mutation_event_log INSERT エラー:', mutLogError)
     }
 
     const { error: erResErr } = await supabase.from('entity_reference_resolution_log').insert({
@@ -1634,7 +1623,7 @@ async function executeMutationPlan(
       confidence: plan.confidence,
       user_confirmed: !plan.requires_confirmation,
     })
-    if (erResErr) console.error('⚠️ [v1.9.0] entity_reference_resolution_log INSERT エラー:', erResErr)
+    if (erResErr) console.error('⚠️ entity_reference_resolution_log INSERT エラー:', erResErr)
 
     const resultMatchedAlias = plan.resolver_strategy === 'aliases_match' 
       ? plan.candidate_rankings[0]?.reason.match(/alias一致:"([^"]+)"/)?.[1]
@@ -1650,7 +1639,7 @@ async function executeMutationPlan(
       matched_alias: resultMatchedAlias,
     }
   } catch (e: any) {
-    console.error('❌ [v1.9.0] executeMutationPlan 例外:', e)
+    console.error('❌ executeMutationPlan 例外:', e)
     return {
       status: 'error',
       error: e.message || 'unknown',
@@ -1683,7 +1672,7 @@ async function saveDecision(sourceMessage: string, intent: Intent, parsed: any, 
     .single()
 
   if (error || !data) {
-    console.error('❌ [v1.9.0] decision_log 記録失敗:', error)
+    console.error('❌ decision_log 記録失敗:', error)
     return
   }
 
@@ -1694,12 +1683,8 @@ async function saveDecision(sourceMessage: string, intent: Intent, parsed: any, 
     decision_log_id: data.id,
     ask_after: askAfter,
   })
-  if (fqError) console.error('❌ [v1.9.0] feedback_queue INSERT 失敗:', fqError)
+  if (fqError) console.error('❌ feedback_queue INSERT 失敗:', fqError)
 }
-
-// ============================================================
-// ★v1.9.0 継承: Conflict/Tentative 処理
-// ============================================================
 
 async function checkConflictingEvents(
   datetime: string,
@@ -1719,10 +1704,10 @@ async function checkConflictingEvents(
       .lte('datetime', windowEnd.toISOString())
       .order('datetime', { ascending: true })
 
-    if (error) console.error('❌ [v1.9.0] checkConflictingEvents エラー:', error)
+    if (error) console.error('❌ checkConflictingEvents エラー:', error)
     return data || []
   } catch (e) {
-    console.error('❌ [v1.9.0] checkConflictingEvents 例外:', e)
+    console.error('❌ checkConflictingEvents 例外:', e)
     return []
   }
 }
@@ -1738,15 +1723,14 @@ async function fetchLatestCalendarConflict(): Promise<any | null> {
       .order('created_at', { ascending: false })
       .limit(1)
       .maybeSingle()
-    if (error) console.error('❌ [v1.9.0] fetchLatestCalendarConflict エラー:', error)
+    if (error) console.error('❌ fetchLatestCalendarConflict エラー:', error)
     return data ?? null
   } catch (e) {
-    console.error('❌ [v1.9.0] fetchLatestCalendarConflict 例外:', e)
+    console.error('❌ fetchLatestCalendarConflict 例外:', e)
     return null
   }
 }
 
-// ★v1.9.0 Bug C 修正: 人物紐付けもする
 async function confirmTentativeCalendar(
   existingId: string,
   newTitle: string,
@@ -1760,7 +1744,7 @@ async function confirmTentativeCalendar(
       .single()
 
     if (getError) {
-      console.error('❌ [v1.9.0] confirmTentativeCalendar 取得エラー:', getError)
+      console.error('❌ confirmTentativeCalendar 取得エラー:', getError)
       return
     }
     if (!current) return
@@ -1776,7 +1760,6 @@ async function confirmTentativeCalendar(
     updates.is_tentative = false
     updates.missing_fields = null
 
-    // ★v1.9.0 Bug C: 人物紐付け
     if (newPeopleName && !current.person_id) {
       const normalizedName = normalizeName(newPeopleName)
       const { data: people, error: peopleErr } = await supabase
@@ -1786,27 +1769,24 @@ async function confirmTentativeCalendar(
         .is('deleted_at', null)
         .limit(1)
       if (peopleErr) {
-        console.error('❌ [v1.9.0] confirm 用 people 検索エラー:', peopleErr)
+        console.error('❌ confirm 用 people 検索エラー:', peopleErr)
       } else if (people?.length) {
         updates.person_id = people[0].id
-        console.log(`✅ [v1.9.0] 仮予定に人物紐付け: ${normalizedName} (${people[0].id})`)
+        console.log(`✅ 仮予定に人物紐付け: ${normalizedName} (${people[0].id})`)
       }
     }
 
     const { error: upError } = await supabase.from('calendar').update(updates).eq('id', existingId)
     if (upError) {
-      console.error('❌ [v1.9.0] confirmTentativeCalendar UPDATE エラー:', upError)
+      console.error('❌ confirmTentativeCalendar UPDATE エラー:', upError)
       return
     }
-    console.log('✅ [v1.9.0] 仮予定を確定:', existingId, updates)
+    console.log('✅ 仮予定を確定:', existingId, updates)
   } catch (e) {
-    console.error('❌ [v1.9.0] confirmTentativeCalendar 例外:', e)
+    console.error('❌ confirmTentativeCalendar 例外:', e)
   }
 }
 
-// ============================================================
-// v1.6.4 継承: ゴミ値排除
-// ============================================================
 const INVALID_SAVE_VALUES = new Set([
   'null', 'undefined', 'NULL', 'None', 'none',
   '(省略可)', '省略可', '(省略)', '省略', '(省略可能)', '省略可能',
@@ -1823,30 +1803,27 @@ function cleanSaveValue(value: any): any {
   const trimmed = value.trim()
   if (!trimmed) return null
   if (INVALID_SAVE_VALUES.has(trimmed)) {
-    console.log('⚠️ [v1.9.0] ゴミ値を検出してスキップ:', trimmed)
+    console.log('⚠️ ゴミ値を検出してスキップ:', trimmed)
     return null
   }
   const ISO_DATETIME_PATTERN = /^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?)?$/
   if (ISO_DATETIME_PATTERN.test(trimmed)) {
-    console.log('⚠️ [v1.9.0] ISO 8601 形式を検出してスキップ:', trimmed)
+    console.log('⚠️ ISO 8601 形式を検出してスキップ:', trimmed)
     return null
   }
   if (trimmed.startsWith('(') && trimmed.endsWith(')')) {
-    console.log('⚠️ [v1.9.0] 括弧メタ注釈を検出してスキップ:', trimmed)
+    console.log('⚠️ 括弧メタ注釈を検出してスキップ:', trimmed)
     return null
   }
   if (trimmed.includes('省略可') || trimmed.includes('省略する')) {
-    console.log('⚠️ [v1.9.0] 省略関連の語を検出してスキップ:', trimmed)
+    console.log('⚠️ 省略関連の語を検出してスキップ:', trimmed)
     return null
   }
   return trimmed
 }
 
-// ★v1.9.0 NEW: save.people 形式ブレ対応(Bug 7)
 function normalizePeopleData(saveData: any): { name: string; note?: string; company?: string; position?: string; phone?: string; email?: string; address?: string } | null {
   if (!saveData) return null
-  
-  // 形式A: object
   if (typeof saveData === 'object' && saveData.name) {
     return {
       name: saveData.name,
@@ -1858,17 +1835,11 @@ function normalizePeopleData(saveData: any): { name: string; note?: string; comp
       address: saveData.address,
     }
   }
-  
-  // 形式B: string(LLM のブレ対応)
   if (typeof saveData === 'string' && saveData.trim().length >= 1) {
     return { name: saveData.trim() }
   }
-  
   return null
 }
-// ============================================================
-// ★v1.9.0 大幅改良: saveStructuredMemory(person_id 紐付け追加)
-// ============================================================
 
 async function saveStructuredMemory(
   save: any,
@@ -1878,11 +1849,11 @@ async function saveStructuredMemory(
 ): Promise<SaveEntityResult[]> {
   const results: SaveEntityResult[] = []
   if (!save) {
-    console.log('📦 [v1.9.0 SAVE] save オブジェクトが null/undefined')
+    console.log('📦 [SAVE] save オブジェクトが null/undefined')
     return results
   }
 
-  console.log('📦 [v1.9.0 SAVE] 入口の save 内容:', JSON.stringify(save))
+  console.log('📦 [SAVE] 入口の save 内容:', JSON.stringify(save))
 
   const signals = preLLMAnalysis?.signals || extractEventSignals(rawText)
   const extractedDt = extractDatetime(rawText)
@@ -1891,9 +1862,6 @@ async function saveStructuredMemory(
 
   const extractedEntities: Array<{ table: string; id: string; role: string }> = []
 
-  // ============================================================
-  // ★v1.9.0: people を先に処理して person_id を calendar に渡す
-  // ============================================================
   let resolvedPersonId: string | null = null
   const peopleData = normalizePeopleData(save.people)
   
@@ -1905,7 +1873,7 @@ async function saveStructuredMemory(
       .ilike('name', `%${normalizedName}%`)
       .is('deleted_at', null)
       .limit(3)
-    if (searchErr) console.error('❌ [v1.9.0] people 検索エラー:', searchErr)
+    if (searchErr) console.error('❌ people 検索エラー:', searchErr)
 
     const existing =
       candidates?.find(
@@ -1925,7 +1893,6 @@ async function saveStructuredMemory(
         mention_count: (existing.mention_count || 0) + 1,
         updated_at: new Date().toISOString(),
       }
-      // ★v1.9.0 Bug F: 電話・メール・住所の保存
       if (peopleData.phone) updateData.phone = peopleData.phone
       if (peopleData.email) updateData.email = peopleData.email
       if (peopleData.address) updateData.address = peopleData.address
@@ -1935,17 +1902,17 @@ async function saveStructuredMemory(
         .update(updateData)
         .eq('id', existing.id)
       if (upErr) {
-        console.error('❌ [v1.9.0] people UPDATE エラー:', upErr)
+        console.error('❌ people UPDATE エラー:', upErr)
         results.push({ table: 'people', attempted: true, success: false, error_code: upErr.code, error_message: upErr.message })
       } else {
-        console.log('✅ [v1.9.0] people UPDATE:', existing.id)
+        console.log('✅ people UPDATE:', existing.id)
         resolvedPersonId = existing.id
         extractedEntities.push({ table: 'people', id: existing.id, role: 'referenced' })
         results.push({ table: 'people', attempted: true, success: true, id: existing.id, role: 'referenced' })
         try {
           await recordReferringExpression(existing.id, normalizedName, 'nickname', null)
         } catch (e) {
-          console.warn('⚠️ [v1.9.0] recordReferringExpression エラー:', e)
+          console.warn('⚠️ recordReferringExpression エラー:', e)
         }
       }
     } else {
@@ -1968,25 +1935,22 @@ async function saveStructuredMemory(
         .select('id')
         .single()
       if (insErr) {
-        console.error('❌ [v1.9.0] people INSERT エラー:', insErr)
+        console.error('❌ people INSERT エラー:', insErr)
         results.push({ table: 'people', attempted: true, success: false, error_code: insErr.code, error_message: insErr.message })
       } else if (inserted) {
-        console.log('✅ [v1.9.0] people INSERT:', inserted.id)
+        console.log('✅ people INSERT:', inserted.id)
         resolvedPersonId = inserted.id
         extractedEntities.push({ table: 'people', id: inserted.id, role: 'created' })
         results.push({ table: 'people', attempted: true, success: true, id: inserted.id, role: 'created' })
         try {
           await recordReferringExpression(inserted.id, normalizedName, 'nickname', null)
         } catch (e) {
-          console.warn('⚠️ [v1.9.0] recordReferringExpression エラー:', e)
+          console.warn('⚠️ recordReferringExpression エラー:', e)
         }
       }
     }
   }
 
-  // ============================================================
-  // task
-  // ============================================================
   const cleanTask = cleanSaveValue(save.task)
   if (cleanTask) {
     const { data: existing, error: existErr } = await supabase
@@ -1995,7 +1959,7 @@ async function saveStructuredMemory(
       .eq('content', cleanTask)
       .is('deleted_at', null)
       .limit(1)
-    if (existErr) console.error('❌ [v1.9.0] task 既存検索エラー:', existErr)
+    if (existErr) console.error('❌ task 既存検索エラー:', existErr)
 
     if (!existing?.length) {
       const { data: inserted, error: insErr } = await supabase
@@ -2012,13 +1976,13 @@ async function saveStructuredMemory(
         .single()
 
       if (insErr) {
-        console.error('❌ [v1.9.0] task INSERT エラー:', insErr)
+        console.error('❌ task INSERT エラー:', insErr)
         results.push({
           table: 'task', attempted: true, success: false,
           error_code: insErr.code, error_message: insErr.message,
         })
       } else if (inserted) {
-        console.log('✅ [v1.9.0] task INSERT 成功:', inserted.id)
+        console.log('✅ task INSERT 成功:', inserted.id)
         extractedEntities.push({ table: 'task', id: inserted.id, role: 'created' })
         results.push({ table: 'task', attempted: true, success: true, id: inserted.id, role: 'created' })
       }
@@ -2029,9 +1993,6 @@ async function saveStructuredMemory(
     results.push({ table: 'task', attempted: true, success: false, skipped_reason: 'cleaned_to_null', error_message: String(save.task) })
   }
 
-  // ============================================================
-  // memo
-  // ============================================================
   const cleanMemo = cleanSaveValue(save.memo)
   if (cleanMemo) {
     const { data: inserted, error: insErr } = await supabase
@@ -2040,10 +2001,10 @@ async function saveStructuredMemory(
       .select('id')
       .single()
     if (insErr) {
-      console.error('❌ [v1.9.0] memo INSERT エラー:', insErr)
+      console.error('❌ memo INSERT エラー:', insErr)
       results.push({ table: 'memo', attempted: true, success: false, error_code: insErr.code, error_message: insErr.message })
     } else if (inserted) {
-      console.log('✅ [v1.9.0] memo INSERT 成功:', inserted.id)
+      console.log('✅ memo INSERT 成功:', inserted.id)
       extractedEntities.push({ table: 'memo', id: inserted.id, role: 'created' })
       results.push({ table: 'memo', attempted: true, success: true, id: inserted.id, role: 'created' })
     }
@@ -2051,21 +2012,15 @@ async function saveStructuredMemory(
     results.push({ table: 'memo', attempted: true, success: false, skipped_reason: 'cleaned_to_null', error_message: String(save.memo) })
   }
 
-  // ============================================================
-  // calendar(★v1.9.0: Pre-LLM conflict 済みならスキップ + person_id 設定)
-  // ============================================================
   const calendarItems: any[] = Array.isArray(save.calendar) 
     ? save.calendar 
     : (save.calendar !== null && save.calendar !== undefined ? [save.calendar] : [])
   
-  // ★v1.9.0 核心: Pre-LLM で conflict 検出済みなら INSERT しない
-  // (systemPrompt が「同じ?別件?」と聞いてる状況)
   const skipCalendarInsert = preLLMAnalysis?.conflict_detection?.has_conflict && calendarItems.length === 1
   
   if (skipCalendarInsert && preLLMAnalysis?.conflict_detection) {
-    console.log('⏸️ [v1.9.0] Pre-LLM conflict 検出済みのため calendar INSERT をスキップ、pending_confirmation 作成へ')
+    console.log('⏸️ Pre-LLM conflict 検出済みのため calendar INSERT をスキップ、pending_confirmation 作成へ')
     
-    // pending_confirmation 作成
     const conflict = preLLMAnalysis.conflict_detection.existing_events[0]
     const newCalendarTitle = typeof calendarItems[0] === 'string' ? calendarItems[0] : calendarItems[0]?.title
     const cleanTitle = cleanSaveValue(newCalendarTitle) || preLLMAnalysis.extracted_title || '予定'
@@ -2120,14 +2075,13 @@ async function saveStructuredMemory(
     })
     
     if (pcError) {
-      console.error('❌ [v1.9.0] pending_confirmation INSERT エラー:', pcError)
+      console.error('❌ pending_confirmation INSERT エラー:', pcError)
       results.push({ table: 'pending_confirmation', attempted: true, success: false, error_code: pcError.code, error_message: pcError.message })
     } else {
-      console.log('🔔 [v1.9.0] Pre-LLM conflict pending 作成完了')
+      console.log('🔔 Pre-LLM conflict pending 作成完了')
       results.push({ table: 'pending_confirmation', attempted: true, success: true, role: 'calendar_conflict_pending' })
     }
   } else {
-    // 通常の calendar INSERT(conflict なし or 複数予定)
     for (let i = 0; i < calendarItems.length; i++) {
       const calendarItem = calendarItems[i]
       const cleanCalendar = cleanSaveValue(
@@ -2151,7 +2105,7 @@ async function saveStructuredMemory(
         itemDatetime = extractedDt?.datetime || null
       }
 
-      console.log('📦 [v1.9.0 SAVE] calendar 処理:', {
+      console.log('📦 [SAVE] calendar 処理:', {
         index: i,
         title: cleanCalendar,
         datetime: itemDatetime,
@@ -2164,7 +2118,6 @@ async function saveStructuredMemory(
       const hasTime = !!itemDatetime
       const isTentative = decideTentative(signals, hasTime, hasExplicitTitle)
 
-      // ★v1.9.0 Bug 9 修正: person_id 紐付け
       const insertData: any = {
         title: cleanCalendar,
         datetime: itemDatetime,
@@ -2188,14 +2141,14 @@ async function saveStructuredMemory(
         .single()
 
       if (insErr) {
-        console.error('❌ [v1.9.0] calendar INSERT エラー:', {
+        console.error('❌ calendar INSERT エラー:', {
           code: insErr.code,
           message: insErr.message,
           payload: { title: cleanCalendar, datetime: itemDatetime, is_tentative: isTentative },
         })
         results.push({ table: 'calendar', attempted: true, success: false, error_code: insErr.code, error_message: insErr.message })
       } else if (inserted) {
-        console.log('✅ [v1.9.0] calendar INSERT 成功:', {
+        console.log('✅ calendar INSERT 成功:', {
           id: inserted.id, title: cleanCalendar, is_tentative: isTentative, 
           category: inferredCategory, person_id: resolvedPersonId,
         })
@@ -2213,9 +2166,6 @@ async function saveStructuredMemory(
     }
   }
 
-  // ============================================================
-  // business
-  // ============================================================
   if (save.business?.name) {
     const b = save.business
     const { data: existing, error: searchErr } = await supabase
@@ -2223,7 +2173,7 @@ async function saveStructuredMemory(
       .select('*')
       .ilike('name', `%${b.name}%`)
       .limit(1)
-    if (searchErr) console.error('❌ [v1.9.0] business 検索エラー:', searchErr)
+    if (searchErr) console.error('❌ business 検索エラー:', searchErr)
 
     if (existing?.length) {
       const { error: upErr } = await supabase
@@ -2234,10 +2184,10 @@ async function saveStructuredMemory(
         })
         .eq('id', existing[0].id)
       if (upErr) {
-        console.error('❌ [v1.9.0] business UPDATE エラー:', upErr)
+        console.error('❌ business UPDATE エラー:', upErr)
         results.push({ table: 'business_master', attempted: true, success: false, error_code: upErr.code, error_message: upErr.message })
       } else {
-        console.log('✅ [v1.9.0] business UPDATE:', existing[0].id)
+        console.log('✅ business UPDATE:', existing[0].id)
         extractedEntities.push({ table: 'business_master', id: existing[0].id, role: 'referenced' })
         results.push({ table: 'business_master', attempted: true, success: true, id: existing[0].id, role: 'referenced' })
       }
@@ -2248,19 +2198,16 @@ async function saveStructuredMemory(
         .select('id')
         .single()
       if (insErr) {
-        console.error('❌ [v1.9.0] business INSERT エラー:', insErr)
+        console.error('❌ business INSERT エラー:', insErr)
         results.push({ table: 'business_master', attempted: true, success: false, error_code: insErr.code, error_message: insErr.message })
       } else if (inserted) {
-        console.log('✅ [v1.9.0] business INSERT:', inserted.id)
+        console.log('✅ business INSERT:', inserted.id)
         extractedEntities.push({ table: 'business_master', id: inserted.id, role: 'created' })
         results.push({ table: 'business_master', attempted: true, success: true, id: inserted.id, role: 'created' })
       }
     }
   }
 
-  // ============================================================
-  // ideas
-  // ============================================================
   const cleanIdeas = cleanSaveValue(save.ideas)
   if (cleanIdeas) {
     const { data: inserted, error: insErr } = await supabase
@@ -2269,10 +2216,10 @@ async function saveStructuredMemory(
       .select('id')
       .single()
     if (insErr) {
-      console.error('❌ [v1.9.0] ideas INSERT エラー:', insErr)
+      console.error('❌ ideas INSERT エラー:', insErr)
       results.push({ table: 'ideas', attempted: true, success: false, error_code: insErr.code, error_message: insErr.message })
     } else if (inserted) {
-      console.log('✅ [v1.9.0] ideas INSERT:', inserted.id)
+      console.log('✅ ideas INSERT:', inserted.id)
       extractedEntities.push({ table: 'ideas', id: inserted.id, role: 'created' })
       results.push({ table: 'ideas', attempted: true, success: true, id: inserted.id, role: 'created' })
     }
@@ -2289,10 +2236,10 @@ async function saveStructuredMemory(
       confidence: 0.85,
       is_user_reviewed: false,
     })
-    if (extLogErr) console.error('⚠️ [v1.9.0] entity_extraction_log INSERT エラー:', extLogErr)
+    if (extLogErr) console.error('⚠️ entity_extraction_log INSERT エラー:', extLogErr)
   }
 
-  console.log('📦 [v1.9.0 SAVE] 完了サマリ:', JSON.stringify(results))
+  console.log('📦 [SAVE] 完了サマリ:', JSON.stringify(results))
   return results
 }
 
@@ -2315,10 +2262,6 @@ async function triggerDaytimeBatch() {
     console.error('❌ バッチ起動エラー:', e)
   }
 }
-
-// ============================================================
-// ★v1.9.0 大幅改良: システムプロンプト(原則14 + Pre-LLM injection)
-// ============================================================
 
 function buildSystemPrompt(
   owner: any,
@@ -2438,7 +2381,6 @@ ${memory.join('\n')}
 `
     : ''
 
-  // ★v1.9.0 核心: Pre-LLM Conflict Injection(原則14 Synchronous Truth)
   const preLLMConflictNote = preLLMAnalysis?.conflict_detection?.has_conflict
     ? (() => {
         const conflict = preLLMAnalysis.conflict_detection.existing_events[0]
@@ -2635,7 +2577,7 @@ NOIDA の発話は、その時点の DB 状態と一致していなければな�
 【save.memo】
 「覚えて」「メモして」の時のみ。
 
-【save.people】★v1.9.0 強化★
+【save.people】
 オーナーが人物名を明示した時のみ保存する:
 - 形式A(推奨): {"name": "田中さん", "note": "...", "company": "...", "phone": "090-...", "email": "..."}
 - 形式B(単純): "田中さん"(名前のみ)
@@ -2677,7 +2619,7 @@ NOIDA の発話は、その時点の DB 状態と一致していなければな�
 }
 
 // ============================================================
-// ★ v1.9.0 POST関数(処理順序全面再設計)
+// ★ v2.0.0 POST関数(Conversation FSM 統合)
 // ============================================================
 
 export async function POST(req: NextRequest) {
@@ -2686,7 +2628,7 @@ export async function POST(req: NextRequest) {
   const rawUserMessage = messages[messages.length - 1]?.content || ''
   const sessionDate = getSessionDate()
 
-  console.log('📥 [v1.9.0 REQUEST]', JSON.stringify({
+  console.log('📥 [v2.0 REQUEST]', JSON.stringify({
     layerA_raw_message: rawUserMessage,
     raw_length: rawUserMessage.length,
     messages_count: messages.length,
@@ -2706,7 +2648,7 @@ export async function POST(req: NextRequest) {
     const correctionResult = await correctInput(rawUserMessage, precedingContext)
     
     if (correctionResult.was_corrected) {
-      console.log('✏️ [v1.9.0 二層の正しさ]', {
+      console.log('✏️ [二層の正しさ]', {
         layerA_original: correctionResult.original,
         layerB_corrected: correctionResult.corrected,
         corrections: correctionResult.corrections,
@@ -2714,13 +2656,101 @@ export async function POST(req: NextRequest) {
       })
       lastUserMessage = correctionResult.corrected
     } else {
-      console.log('✏️ [v1.9.0 二層の正しさ]', {
+      console.log('✏️ [二層の正しさ]', {
         layerA_original: rawUserMessage,
         layerB_corrected: '(差分なし)',
       })
     }
   } catch (e) {
-    console.error('❌ [v1.9.0 INPUT訂正] エラー、訂正せずに処理続行:', e)
+    console.error('❌ [INPUT訂正] エラー、訂正せずに処理続行:', e)
+  }
+
+  // ============================================================
+  // ★v2.0: Conversation FSM — clarification 文脈の復元
+  // ============================================================
+  let clarificationMergedFrom: string | null = null
+  let activeConversationStateId: string | null = null
+  const activeState = await fetchActiveConversationState(sessionDate)
+
+  if (activeState && activeState.state === 'awaiting_clarification') {
+    const partial = activeState.partial_data || {}
+    const partialOriginal = partial.original_text || ''
+    const target = activeState.clarification_target as 'title' | 'datetime' | 'both' | 'vague_answer_retry' | null
+
+    const trimmed = lastUserMessage.trim()
+    const isShortAnswer = trimmed.length < 15 && !/[。!?]/.test(trimmed)
+
+    if (isShortAnswer && partialOriginal) {
+      const { merged, is_vague_answer } = mergeClarificationContext(
+        partialOriginal,
+        trimmed,
+        target
+      )
+
+      console.log('🔄 [v2.0 FSM] clarification merge:', {
+        state_id: activeState.id,
+        original: partialOriginal,
+        answer: trimmed,
+        target,
+        merged,
+        is_vague_answer,
+      })
+
+      if (is_vague_answer) {
+        console.log('⚠️ [v2.0 FSM] 曖昧語回答を検出、再 clarification 発動')
+        
+        await resolveConversationState(activeState.id, 'resolved')
+
+        const reply = `「${trimmed}」だけだと曖昧だから、もう少し具体的に教えて。(例: ${trimmed === '会議' ? '営業会議 / 定例' : trimmed + 'の内容'})`
+
+        await supabase.from('talk_master').insert({
+          role: 'user',
+          content: rawUserMessage,
+          content_parsed: lastUserMessage !== rawUserMessage ? lastUserMessage : null,
+          intent: 'execute',
+          importance: 'B',
+          session_date: sessionDate,
+        })
+        await supabase.from('talk_master').insert({
+          role: 'noida',
+          content: reply,
+          intent: 'execute',
+          importance: 'B',
+          session_date: sessionDate,
+        })
+
+        await createClarificationState(
+          {
+            original_text: partialOriginal,
+            previous_vague_answer: trimmed,
+            extracted_datetime: partial.extracted_datetime,
+          },
+          'vague_answer_retry',
+          userTalkIdOrFallback(null),
+          null
+        )
+
+        return NextResponse.json({
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              reply,
+              options: [],
+              mode: 'execute',
+              save: {},
+              decision_log: {
+                should_log: true,
+                decision_text: `曖昧回答「${trimmed}」で再 clarification`,
+              },
+            }),
+          }],
+        })
+      }
+
+      lastUserMessage = merged
+      clarificationMergedFrom = partialOriginal
+      activeConversationStateId = activeState.id
+    }
   }
 
   if (/更新して|整理して|学習して|マスタ更新/.test(lastUserMessage)) {
@@ -2745,7 +2775,6 @@ export async function POST(req: NextRequest) {
   // ============================================================
   const replyType = detectReplyType(lastUserMessage)
 
-  // 1. Calendar Conflict の先行処理
   const calendarConflict = await fetchLatestCalendarConflict()
   if (calendarConflict && (replyType === 'conflict_same' || replyType === 'conflict_different')) {
     const plan = calendarConflict.mutation_plan as any
@@ -2758,7 +2787,6 @@ export async function POST(req: NextRequest) {
         new_event_data.person_name || null
       )
 
-      // ★v1.9.0 check_status バグ修正: 'confirmed' を使う
       await resolvePending(calendarConflict.id, 'confirmed')
 
       const replyTitle = new_event_data.title || '予定'
@@ -2796,7 +2824,6 @@ export async function POST(req: NextRequest) {
 
     if (replyType === 'conflict_different') {
       // ★v1.9.0.1 Bug G 止血: 曖昧題目なら INSERT せず clarification に戻す
-      // Takuma 原則14「DB と発話の一致」曖昧なまま確定 INSERT は嘘応答
       const newTitleForCheck = String(new_event_data.title || '').trim()
       if (VAGUE_TOPICS.test(newTitleForCheck)) {
         await resolvePending(calendarConflict.id, 'cancelled')
@@ -2861,7 +2888,7 @@ export async function POST(req: NextRequest) {
       const { error: insErr } = await supabase
         .from('calendar')
         .insert(insertData)
-      if (insErr) console.error('❌ [v1.9.0] calendar INSERT(別件)エラー:', insErr)
+      if (insErr) console.error('❌ calendar INSERT(別件)エラー:', insErr)
 
       await resolvePending(calendarConflict.id, 'confirmed')
 
@@ -2899,15 +2926,12 @@ export async function POST(req: NextRequest) {
     }
   }
 
-  // 2. Modify Pending の先行処理
   const modifyPending = await fetchLatestModifyPending()
   if (modifyPending && (replyType === 'modify_approve' || replyType === 'modify_reject')) {
     if (replyType === 'modify_approve') {
       const plan = modifyPending.mutation_plan as MutationPlan
-      // ★target_id を復活させて execute
       const ss = modifyPending.subject_snapshot || {}
       if (ss.candidate_ids?.length === 1) {
-        // 候補1つなら即実行
         const executedPlan: MutationPlan = {
           ...plan,
           target_id: ss.candidate_ids[0],
@@ -3034,10 +3058,9 @@ export async function POST(req: NextRequest) {
     })
   }
 
-  // Acknowledgement(ありがとう等)
   const ackType = detectAcknowledgment(lastUserMessage)
   if (ackType) {
-    console.log('✅ [v1.9.0 ACK発火]', ackType)
+    console.log('✅ [ACK発火]', ackType)
 
     const { data: pendingTasks, error: ptErr } = await supabase
       .from('task')
@@ -3048,7 +3071,7 @@ export async function POST(req: NextRequest) {
       .neq('state', 'cancelled')
       .order('created_at', { ascending: true })
       .limit(1)
-    if (ptErr) console.error('❌ [v1.9.0] ACK用task取得エラー:', ptErr)
+    if (ptErr) console.error('❌ ACK用task取得エラー:', ptErr)
 
     const nowISO = new Date().toISOString()
     const { data: upcomingEvents, error: ueErr } = await supabase
@@ -3059,7 +3082,7 @@ export async function POST(req: NextRequest) {
       .gte('datetime', nowISO)
       .order('datetime', { ascending: true })
       .limit(1)
-    if (ueErr) console.error('❌ [v1.9.0] ACK用calendar取得エラー:', ueErr)
+    if (ueErr) console.error('❌ ACK用calendar取得エラー:', ueErr)
 
     const prefixMap: Record<string, string[]> = {
       gratitude: ['どういたしまして。', 'お役に立てて何より。'],
@@ -3131,7 +3154,6 @@ export async function POST(req: NextRequest) {
   const memory = await fetchMemory(intent, keywords)
   const isHighRisk = HIGH_RISK_KEYWORDS.test(lastUserMessage)
 
-  // ★v1.9.0 核心: Pre-LLM Analysis
   const preLLMAnalysis = await performPreLLMAnalysis(lastUserMessage, intent)
   
   const askingStrategy = decideAskingStrategy(
@@ -3141,7 +3163,7 @@ export async function POST(req: NextRequest) {
     preLLMAnalysis.has_vague_topic
   )
 
-  console.log('🎯 [v1.9.0 CLASSIFY]', {
+  console.log('🎯 [CLASSIFY]', {
     router_intent: intent,
     crisis: crisisType,
     non_intervention: nonInterventionType,
@@ -3155,6 +3177,7 @@ export async function POST(req: NextRequest) {
     is_calendar_add: preLLMAnalysis.is_calendar_add,
     conflict_detected: preLLMAnalysis.conflict_detection.has_conflict,
     keywords,
+    clarification_merged_from: clarificationMergedFrom,
   })
 
   const { data: userTalkRecord, error: utErr } = await supabase
@@ -3169,7 +3192,7 @@ export async function POST(req: NextRequest) {
     })
     .select('id')
     .single()
-  if (utErr) console.error('❌ [v1.9.0] talk_master(user) INSERT エラー:', utErr)
+  if (utErr) console.error('❌ talk_master(user) INSERT エラー:', utErr)
 
   const userMessageId = userTalkRecord?.id || `msg_${Date.now()}`
 
@@ -3180,7 +3203,6 @@ export async function POST(req: NextRequest) {
   if (intent === 'modify' && modifyAction && !crisisType && !nonInterventionType) {
     const plan = await generateMutationPlan(lastUserMessage, modifyAction, userMessageId)
     if (plan) {
-      // ★v1.9.0: needs_confirmation なら modify pending 作成して実行しない
       if (plan.requires_confirmation) {
         await createModifyPending(plan, userMessageId, lastUserMessage)
       }
@@ -3192,14 +3214,14 @@ export async function POST(req: NextRequest) {
           plan.target_table
         )
         if (isDebouncedUpdate) {
-          console.log('🔕 [v1.9.0 DEBOUNCE] 60秒以内の連続更新、応答を最小化')
+          console.log('🔕 [DEBOUNCE] 60秒以内の連続更新、応答を最小化')
         }
       }
     }
   }
 
   const selectedModel = selectModel(intent, crisisType, nonInterventionType, isHighRisk)
-  console.log('🤖 [v1.9.0 MODEL]', {
+  console.log('🤖 [MODEL]', {
     model: selectedModel,
     intent,
     reason: crisisType || nonInterventionType || (isHighRisk ? 'high_risk' : intent),
@@ -3246,7 +3268,7 @@ export async function POST(req: NextRequest) {
   const data = await res.json()
   const text = data.choices?.[0]?.message?.content ?? ''
 
-  console.log('🔍 [v1.9.0 LLM RAW]', JSON.stringify({
+  console.log('🔍 [LLM RAW]', JSON.stringify({
     model: selectedModel,
     text_length: text.length,
     text_preview: text.substring(0, 400),
@@ -3266,9 +3288,9 @@ export async function POST(req: NextRequest) {
     const jsonStr = text.substring(text.indexOf('{'), text.lastIndexOf('}') + 1)
     parsed = JSON.parse(jsonStr)
   } catch (e) {
-    console.error('❌ [v1.9.0] JSON parse失敗(1回目):', { error: String(e), text_preview: text.substring(0, 300) })
+    console.error('❌ JSON parse失敗(1回目):', { error: String(e), text_preview: text.substring(0, 300) })
 
-    console.log('🔄 [v1.9.0] JSON リトライ')
+    console.log('🔄 JSON リトライ')
     try {
       const retryRes = await fetch('https://api.openai.com/v1/chat/completions', {
         method: 'POST',
@@ -3297,9 +3319,9 @@ export async function POST(req: NextRequest) {
 
       const retryJsonStr = retryText.substring(retryText.indexOf('{'), retryText.lastIndexOf('}') + 1)
       parsed = JSON.parse(retryJsonStr)
-      console.log('✅ [v1.9.0] リトライ成功')
+      console.log('✅ リトライ成功')
     } catch (retryErr) {
-      console.error('❌ [v1.9.0] リトライも失敗:', retryErr)
+      console.error('❌ リトライも失敗:', retryErr)
       parsed = {
         reply: text,
         mode: intent,
@@ -3310,12 +3332,44 @@ export async function POST(req: NextRequest) {
     }
   }
 
-  // ★v1.9.0: Pre-LLM conflict 検出時は options を強制セット
   if (preLLMAnalysis.conflict_detection.has_conflict && (!parsed.options || parsed.options.length === 0)) {
     parsed.options = ['同じ', '別件']
   }
 
-  console.log('📦 [v1.9.0 PARSED]', JSON.stringify({
+  // ★v2.0 FSM: clarification 応答時に conversation_state 作成
+  const shouldCreateClarificationState =
+    askingStrategy === 'clarification' &&
+    preLLMAnalysis.is_calendar_add &&
+    !preLLMAnalysis.conflict_detection.has_conflict &&
+    !clarificationMergedFrom
+
+  if (shouldCreateClarificationState) {
+    const missingFields: string[] = []
+    if (!preLLMAnalysis.has_explicit_title || preLLMAnalysis.has_vague_topic) missingFields.push('title')
+    if (!preLLMAnalysis.signals.has_explicit_time) missingFields.push('datetime')
+    const target: 'title' | 'datetime' | 'both' = 
+      missingFields.length === 2 ? 'both' : (missingFields[0] as 'title' | 'datetime')
+
+    await createClarificationState(
+      {
+        original_text: lastUserMessage,
+        extracted_datetime: preLLMAnalysis.extracted_datetime,
+        extracted_title: preLLMAnalysis.extracted_title,
+        signals: preLLMAnalysis.signals,
+        inferred_category: preLLMAnalysis.inferred_category,
+      },
+      target,
+      userMessageId,
+      null
+    )
+  }
+
+  // merge 完了時は元 state を resolve
+  if (activeConversationStateId) {
+    await resolveConversationState(activeConversationStateId, 'resolved')
+  }
+
+  console.log('📦 [PARSED]', JSON.stringify({
     mode: parsed.mode,
     reply_preview: (parsed.reply || '').substring(0, 100),
     save_keys_present: parsed.save ? Object.keys(parsed.save) : [],
@@ -3348,11 +3402,11 @@ export async function POST(req: NextRequest) {
       finalIntent === 'empathy' || finalIntent === 'objection' ? 'A' : 'B',
     session_date: sessionDate,
   })
-  if (noTalkErr) console.error('❌ [v1.9.0] talk_master(noida) INSERT エラー:', noTalkErr)
+  if (noTalkErr) console.error('❌ talk_master(noida) INSERT エラー:', noTalkErr)
 
   const elapsedMs = Date.now() - requestStartTime
   const wasCorrected = lastUserMessage !== rawUserMessage
-  console.log('🏁 [v1.9.0 DONE]', JSON.stringify({
+  console.log('🏁 [v2.0 DONE]', JSON.stringify({
     elapsed_ms: elapsedMs,
     final_intent: finalIntent,
     model_used: selectedModel,
@@ -3365,6 +3419,7 @@ export async function POST(req: NextRequest) {
     asking_strategy: askingStrategy,
     debounced: isDebouncedUpdate,
     pre_llm_conflict_detected: preLLMAnalysis.conflict_detection.has_conflict,
+    fsm_merged: !!clarificationMergedFrom,
   }))
 
   return NextResponse.json({
