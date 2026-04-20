@@ -1309,6 +1309,77 @@ async function resolveReference(
     console.error('❌ resolveReference 例外:', e)
   }
 
+  // ============================================================
+  // ★v2.1.1 Bug M 修正: calendar に対する時刻・日付絞り込み
+  // ============================================================
+  // ユーザー入力に「17時」「明日」などが含まれる時は、
+  // 候補をその条件に一致するものだけに絞る。
+  // 絞った結果 1+ 件あれば fallback せず、その中から選ぶ。
+  if (targetTable === 'calendar' && candidates.length > 1) {
+    const hourMatch = text.match(/(\d{1,2})時/) || text.match(/(\d{1,2}):\d{2}/)
+    const targetHour = hourMatch ? parseInt(hourMatch[1]) : null
+    
+    const hasTomorrow = /明日/.test(text)
+    const hasToday = /今日/.test(text)
+    const hasDayAfter = /明後日/.test(text)
+    const hasYesterday = /昨日/.test(text)
+    
+    const now = new Date()
+    let targetDateStr: string | null = null
+    if (hasTomorrow) {
+      const d = new Date(now)
+      d.setDate(d.getDate() + 1)
+      targetDateStr = d.toISOString().split('T')[0]
+    } else if (hasToday) {
+      targetDateStr = now.toISOString().split('T')[0]
+    } else if (hasDayAfter) {
+      const d = new Date(now)
+      d.setDate(d.getDate() + 2)
+      targetDateStr = d.toISOString().split('T')[0]
+    } else if (hasYesterday) {
+      const d = new Date(now)
+      d.setDate(d.getDate() - 1)
+      targetDateStr = d.toISOString().split('T')[0]
+    }
+    
+    if (targetHour !== null || targetDateStr) {
+      const filtered = candidates.filter((c: any) => {
+        if (!c.datetime) return false
+        const dt = new Date(c.datetime)
+        if (isNaN(dt.getTime())) return false
+        
+        // 時刻フィルタ(UTC ではなく JST で比較するため、getUTCHours の代わりに datetime 文字列から抽出)
+        if (targetHour !== null) {
+          // c.datetime 例: "2026-04-21 14:00:00+00" or ISO
+          const dtStr = String(c.datetime)
+          const hourFromDt = dt.getUTCHours()  // Supabase の datetime は UTC 保存されてる想定
+          // JST 補正せず UTC 比較(NOIDA は JST で入力→UTC 保存してるので、14時入力 = 14:00 UTC)
+          if (hourFromDt !== targetHour) return false
+        }
+        
+        // 日付フィルタ
+        if (targetDateStr) {
+          const dateFromDt = dt.toISOString().split('T')[0]
+          if (dateFromDt !== targetDateStr) return false
+        }
+        
+        return true
+      })
+      
+      console.log('🎯 [v2.1.1 Bug M] calendar 時刻・日付絞り込み:', {
+        target_hour: targetHour,
+        target_date: targetDateStr,
+        before: candidates.length,
+        after: filtered.length,
+      })
+      
+      // 絞り込んだ結果が 1 件以上あれば使う、0 件なら fallback(従来動作)
+      if (filtered.length > 0) {
+        candidates = filtered
+      }
+    }
+  }
+
   if (candidates.length === 0) {
     return {
       target_id: null,
