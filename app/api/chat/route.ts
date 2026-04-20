@@ -510,6 +510,24 @@ function extractKeywords(text: string) {
 function extractDatetime(text: string): { title: string; datetime: string | null } | null {
   const now = new Date()
   const patterns: { regex: RegExp; resolver: (m: RegExpMatchArray) => Date | null }[] = [
+    // ★v2.1.4 Bug P: 「時半」対応。より長い「時半」パターンを先に置く
+    {
+      regex: /明日[のは]?\s*(\d{1,2})時半/,
+      resolver: (m) => {
+        const d = new Date(now)
+        d.setDate(d.getDate() + 1)
+        d.setHours(parseInt(m[1]), 30, 0, 0)
+        return d
+      },
+    },
+    {
+      regex: /今日[のは]?\s*(\d{1,2})時半/,
+      resolver: (m) => {
+        const d = new Date(now)
+        d.setHours(parseInt(m[1]), 30, 0, 0)
+        return d
+      },
+    },
     {
       regex: /明日[のは]?\s*(\d{1,2})時(\d{1,2})?分?/,
       resolver: (m) => {
