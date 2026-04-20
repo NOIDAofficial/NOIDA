@@ -712,8 +712,21 @@ async function performPreLLMAnalysis(
   
   const modifyAction = detectModifyAction(text)
   
+  // ★Bug A: タイトルの明示性を階層化
+  // 明示タイトル: 「犬の散歩」「田中さんとの会議」など具体的
+  // 曖昧題目: 「打ち合わせ」「会議」「予定」など単体
   const trimmed = text.trim()
   const hasVagueTopic = VAGUE_TOPICS_CONTAINS.test(trimmed)
+  
+  // 明示性の判定: 曖昧題目以外の情報(人物・場所・具体名詞)があれば明示と見なす
+  const hasExplicitTitle = 
+    signals.has_explicit_person ||
+    signals.has_explicit_location ||
+    signals.has_solo_context ||
+    signals.has_family_context ||
+    signals.has_appointment_context ||
+    // 曖昧題目以外の固有名詞っぽいもの
+    (trimmed.length >= 6 && !VAGUE_TOPICS.test(trimmed))
   
   // カレンダー追加の意図判定
   const isCalendarAdd = 
@@ -725,9 +738,10 @@ async function performPreLLMAnalysis(
      signals.has_solo_context ||
      hasVagueTopic)
   
-  // ★v1.9.1: タイトル抽出を先に実行(hasExplicitTitle の判定に使うため)
+  // タイトル抽出(シンプル版)
   let extractedTitle: string | null = null
   if (isCalendarAdd) {
+    // 時刻・日付表現を除去
     const cleaned = text
       .replace(/明日|今日|明後日|来週|今週|昨日/g, '')
       .replace(/(月|火|水|木|金|土|日)曜/g, '')
@@ -740,24 +754,8 @@ async function performPreLLMAnalysis(
     extractedTitle = cleaned.length >= 2 ? cleaned : null
   }
   
-  // ★v1.9.1 根治: hasExplicitTitle を extractedTitle ベースに
-  // (v1.9.0 の length fallback は time marker 込みで判定してたため
-  //  「明日14時に打ち合わせ」→ length=10 → explicit 誤判定 = Bug G root cause)
-  const hasExplicitTitle = 
-    signals.has_explicit_person ||
-    signals.has_explicit_location ||
-    signals.has_solo_context ||
-    signals.has_family_context ||
-    signals.has_appointment_context ||
-    // 抽出後のタイトルが曖昧語単体でなければ明示
-    (!!extractedTitle && !VAGUE_TOPICS.test(extractedTitle))
-  
-  // ★v1.9.1 根治: 曖昧題目のとき conflict 検出しない(clarification 優先)
-  // Takuma 原則14「同じって何が?」— 曖昧なまま「同じ?別件?」は不誠実
-  // タイトルが確定してから conflict 判定する方が原則14 合致
-  const shouldDetectConflict = isCalendarAdd && hasExplicitTitle
-  
-  const conflictDetection = shouldDetectConflict
+  // 重複検出
+  const conflictDetection = isCalendarAdd
     ? await checkConflictingEventsForPreLLM(
         extractedDt?.datetime || null,
         extractedTitle,
@@ -2795,54 +2793,6 @@ export async function POST(req: NextRequest) {
     }
 
     if (replyType === 'conflict_different') {
-      // ★v1.9.0.1 Bug G 止血: 曖昧題目なら INSERT せず clarification に戻す
-      // Takuma 原則14「DB と発話の一致」曖昧なまま確定 INSERT は嘘応答
-      const newTitleForCheck = String(new_event_data.title || '').trim()
-      if (VAGUE_TOPICS.test(newTitleForCheck)) {
-        await resolvePending(calendarConflict.id, 'cancelled')
-
-        const dtHint = new_event_data.datetime
-          ? new Date(new_event_data.datetime).toLocaleString('ja-JP', {
-              month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit',
-            })
-          : null
-        const reply = dtHint
-          ? `${dtHint}の何の${newTitleForCheck}?`
-          : `何の${newTitleForCheck}?`
-
-        await supabase.from('talk_master').insert({
-          role: 'user',
-          content: rawUserMessage,
-          content_parsed: lastUserMessage !== rawUserMessage ? lastUserMessage : null,
-          intent: 'execute',
-          importance: 'B',
-          session_date: sessionDate,
-        })
-        await supabase.from('talk_master').insert({
-          role: 'noida',
-          content: reply,
-          intent: 'execute',
-          importance: 'B',
-          session_date: sessionDate,
-        })
-
-        return NextResponse.json({
-          content: [{
-            type: 'text',
-            text: JSON.stringify({
-              reply,
-              options: [],
-              mode: 'execute',
-              save: {},
-              decision_log: {
-                should_log: true,
-                decision_text: `別件選択だが題目「${newTitleForCheck}」が曖昧なため clarification に戻した`,
-              },
-            }),
-          }],
-        })
-      }
-
       const insertData: any = {
         title: new_event_data.title,
         datetime: new_event_data.datetime,
