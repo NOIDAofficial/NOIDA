@@ -2105,11 +2105,14 @@ function normalizeCalendarTitle(rawTitle: string): string {
     .replace(/(月|火|水|木|金|土|日)曜日?/g, '')
     .replace(/\d{1,2}月\d{1,2}日/g, '')
     .replace(/\d{1,2}\/\d{1,2}/g, '')
-    // 時刻表現
+    // 時刻表現(順序重要:より長いパターンを先に)
     .replace(/\d{1,2}時\d{1,2}分?/g, '')
     .replace(/\d{1,2}時半/g, '')
     .replace(/\d{1,2}時/g, '')
     .replace(/\d{1,2}:\d{2}/g, '')
+    // ★v2.1.3 Bug P 修正: LLM が title に「半」だけ残した場合の除去
+    //   例:LLM が「14時半」を「14時」と「半」に分けて、"半打ち合わせ" と save してくる
+    .replace(/^半/, '')
     // 助詞(時刻・日付が除去された後の「に」「の」「から」を除去)
     .replace(/^に/, '')
     .replace(/^の/, '')
@@ -2118,9 +2121,9 @@ function normalizeCalendarTitle(rawTitle: string): string {
     .replace(/\s+/g, ' ')
     .trim()
   
-  // 先頭の「の」「に」「から」を繰り返し除去
-  while (/^(の|に|から|で)/.test(cleaned)) {
-    cleaned = cleaned.replace(/^(の|に|から|で)/, '').trim()
+  // 先頭の「の」「に」「から」「半」を繰り返し除去
+  while (/^(の|に|から|で|半)/.test(cleaned)) {
+    cleaned = cleaned.replace(/^(の|に|から|で|半)/, '').trim()
   }
   
   // 空になったら元の title を返す(過剰正規化防止)
