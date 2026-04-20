@@ -314,6 +314,22 @@ function extractDatetime(text: string): { title: string; datetime: string | null
         return d
       },
     },
+    // ★v1.7.1: 「14時から」「14時に」「14時〜」など、日付指定なしの時刻単独パターン
+    //   過ぎた時刻は翌日扱い(秘書として過去を予定に入れない)
+    {
+      regex: /(?<!\d)(\d{1,2})時(\d{1,2})?分?(から|に|〜|~|より)/,
+      resolver: (m) => {
+        const hour = parseInt(m[1])
+        const minute = m[2] ? parseInt(m[2]) : 0
+        const d = new Date(now)
+        d.setHours(hour, minute, 0, 0)
+        // 今の時刻より前なら翌日扱い
+        if (d.getTime() <= now.getTime()) {
+          d.setDate(d.getDate() + 1)
+        }
+        return d
+      },
+    },
   ]
 
   for (const { regex, resolver } of patterns) {
@@ -1262,6 +1278,13 @@ function cleanSaveValue(value: any): any {
     console.log('⚠️ [v1.6.4] ゴミ値を検出してスキップ:', trimmed)
     return null
   }
+  // ★v1.7.1: ISO 8601 形式を title として保存するのを防ぐ
+  //   LLM が save.calendar: "2026-04-21T14:00:00" のように返すことがあるため
+  const ISO_DATETIME_PATTERN = /^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?)?$/
+  if (ISO_DATETIME_PATTERN.test(trimmed)) {
+    console.log('⚠️ [v1.7.1] ISO 8601 形式を検出してスキップ:', trimmed)
+    return null
+  }
   // 括弧だけで始まる文字列はメタ注釈の可能性が高い
   if (trimmed.startsWith('(') && trimmed.endsWith(')')) {
     console.log('⚠️ [v1.6.4] 括弧メタ注釈を検出してスキップ:', trimmed)
@@ -1801,9 +1824,14 @@ executionNoteの結果に従って正確に報告する。
 
 ■保存ルール(Modifyモードでは適用されない)
 ・calendar: ユーザーが日時・予定を言った時のみ
-  - ★v1.7.0: datetimeのISO文字列(例: "2026-04-20T14:00:00")をtitleとして返してはいけない
-  - titleは自然言語で具体的に(例: "会議", "田中さんとの新規案件の会議")
-  - 「誰と」や「何の会議か」が曖昧な場合は、曖昧なまま保存してOK(システムが仮予定として扱う)
+  - ★★v1.7.1 絶対禁止★★
+    save.calendar の値に日時形式("2026-04-21T14:00:00" "2026-04-20" など)を入れてはいけない
+    → システムが自動でスキップして保存失敗する
+  - titleは必ず「予定の中身」を自然言語で書く
+    ✅ 良い例: "会議" "田中さんとの新規案件の会議" "病院" "散髪"
+    ❌ 悪い例: "2026-04-21T14:00:00" "2026-04-20" "14:00" "明日14時"
+  - 日時情報は save.calendar に入れず、ユーザー発言から extractDatetime が自動抽出する
+  - 「誰と」や「何の会議か」が曖昧な場合は、"会議" だけ入れればOK(システムが仮予定として扱う)
   - 仮予定の場合、replyで「詳細分かり次第教えて」「誰と/何か決まったら言って」と促すこと
 ・task: ユーザーが明確にタスクを述べた時のみ
 ・memo: 「覚えて」「メモして」と言った時のみ
