@@ -196,6 +196,7 @@ type PreLLMAnalysis = {
   modify_action: ModifyAction | null
   has_explicit_title: boolean
   has_vague_topic: boolean
+  time_undefined: boolean
   signals: EventSignals
   inferred_category: EventCategory
 }
@@ -258,6 +259,10 @@ function detectAcknowledgment(text: string): 'gratitude' | 'acknowledgment' | 'n
 
 const VAGUE_TOPICS = /^(会議|ミーティング|打ち合わせ|MTG|mtg|アポ|予定|meeting|Meeting|用事|タスク|やること)$/
 const VAGUE_TOPICS_CONTAINS = /(会議|ミーティング|打ち合わせ|MTG|mtg|アポ|予定|用事)/
+
+// ★v2.1.5: 時間未定を明示的に示すパターン
+//   「時間未定」「時間はまだ」「時刻未定」「まだ時間決まってない」等
+const TIME_UNDEFINED_PATTERNS = /(時間未定|時刻未定|時間(は)?まだ|時間(は)?決まって(いない|ない)|時間(は)?未定|時(間|刻)?決まったら|あとで時間|時間後で)/
 
 // ============================================================
 // ★v2.0.0 NEW: Conversation FSM
@@ -946,6 +951,9 @@ async function performPreLLMAnalysis(
       )
     : { has_conflict: false, existing_events: [], window_description: '' }
   
+  // ★v2.1.5: 時間未定検出
+  const isTimeUndefined = TIME_UNDEFINED_PATTERNS.test(trimmed)
+  
   return {
     intent_hint: intent,
     is_calendar_add: isCalendarAdd,
@@ -955,6 +963,7 @@ async function performPreLLMAnalysis(
     modify_action: modifyAction,
     has_explicit_title: hasExplicitTitle,
     has_vague_topic: hasVagueTopic,
+    time_undefined: isTimeUndefined,
     signals,
     inferred_category: inferredCategory,
   }
@@ -3967,9 +3976,8 @@ export async function POST(req: NextRequest) {
 
   // ============================================================
   // ★v2.0.1 Bug I 修正: clarification 時のコード側強制ガード
+  // ★v2.1.5 拡張: 仮保存(題目曖昧+時刻あり)+ 時間未定許容
   // ============================================================
-  // LLM が clarification 指示を無視して「入れた」と過去形応答 + save 埋めてくる
-  // コード側で強制的に save を null 化、reply も書き換えることで原則14 を守る
   const isClarificationMode = 
     askingStrategy === 'clarification' &&
     preLLMAnalysis.is_calendar_add &&
@@ -3977,37 +3985,84 @@ export async function POST(req: NextRequest) {
     !clarificationMergedFrom
 
   if (isClarificationMode) {
-    console.log('🛡️ [v2.0.1 GUARD] clarification mode — LLM save を強制 null 化', {
-      original_save_calendar: parsed.save?.calendar,
-      original_reply: (parsed.reply || '').substring(0, 50),
-    })
-    // save を全て null に(LLM の INSERT 暴走を止める)
-    parsed.save = {
-      memo: null,
-      calendar: null,
-      task: null,
-      people: null,
-      business: null,
-      ideas: null,
-    }
-    // reply を書き換え(原則14:DB と発話の一致)
     const missingTitle = !preLLMAnalysis.has_explicit_title || preLLMAnalysis.has_vague_topic
     const missingTime = !preLLMAnalysis.signals.has_explicit_time
-    if (missingTitle && missingTime) {
-      parsed.reply = '何時の何の予定?'
-    } else if (missingTitle) {
-      // 時刻は分かってる、題目だけ欠けてる
-      const dtStr = preLLMAnalysis.extracted_datetime 
-        ? new Date(preLLMAnalysis.extracted_datetime).toLocaleString('ja-JP', {
-            month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit',
-          })
-        : null
-      parsed.reply = dtStr ? `${dtStr}の何の予定?` : '何の予定?'
-    } else if (missingTime) {
-      parsed.reply = '何時?'
+    const timeUndefined = preLLMAnalysis.time_undefined
+
+    // ============ ケース A: 時刻あり + 曖昧題目 → 仮保存(is_tentative=true)============
+    // v2.1.5 新機能:「明日14時半に会議」→ 「会議」として仮保存、follow-up で何の会議か聞く
+    if (!missingTime && missingTitle && preLLMAnalysis.extracted_datetime) {
+      const vagueTitle = preLLMAnalysis.extracted_title || '予定'
+      const cleanVague = vagueTitle.trim()
+      
+      console.log('💡 [v2.1.5] 曖昧題目+時刻 → 仮保存フロー:', { title: cleanVague, dt: preLLMAnalysis.extracted_datetime })
+      
+      // 仮保存を LLM の save に強制設定(INSERT ルートに流れる)
+      parsed.save = {
+        memo: null,
+        calendar: cleanVague,
+        task: null,
+        people: null,
+        business: null,
+        ideas: null,
+      }
+      
+      // reply を「仮で入れた、何の?」にする
+      const dtStr = new Date(preLLMAnalysis.extracted_datetime).toLocaleString('ja-JP', {
+        month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit',
+      })
+      parsed.reply = `${dtStr}に「${cleanVague}」を入れた。何の${cleanVague}?`
+      parsed.mode = 'execute'
+      parsed.options = []
+      // NOTE: is_tentative=true で入れるため、後続の INSERT で tentative フラグを立てる
+      // follow-up では conversation_state FSM が前回の calendar id を保持し、title update に回る
     }
-    parsed.mode = 'execute'
-    parsed.options = []
+    // ============ ケース B: 時間未定の明示 → datetime=NULL で保存 ============
+    else if (timeUndefined && !missingTitle) {
+      const title = preLLMAnalysis.extracted_title || '予定'
+      console.log('💡 [v2.1.5] 時間未定明示 → datetime=NULL 保存:', { title })
+      
+      parsed.save = {
+        memo: null,
+        calendar: title,
+        task: null,
+        people: null,
+        business: null,
+        ideas: null,
+      }
+      parsed.reply = `${title}(時間未定)を入れた。時間決まったら教えて。`
+      parsed.mode = 'execute'
+      parsed.options = []
+    }
+    // ============ ケース C: 従来の強制ガード(両方欠落 or 時刻だけ欠落)============
+    else {
+      console.log('🛡️ [v2.0.1 GUARD] clarification mode — LLM save を強制 null 化', {
+        original_save_calendar: parsed.save?.calendar,
+        original_reply: (parsed.reply || '').substring(0, 50),
+      })
+      parsed.save = {
+        memo: null,
+        calendar: null,
+        task: null,
+        people: null,
+        business: null,
+        ideas: null,
+      }
+      if (missingTitle && missingTime) {
+        parsed.reply = '何時の何の予定?'
+      } else if (missingTitle) {
+        const dtStr = preLLMAnalysis.extracted_datetime 
+          ? new Date(preLLMAnalysis.extracted_datetime).toLocaleString('ja-JP', {
+              month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit',
+            })
+          : null
+        parsed.reply = dtStr ? `${dtStr}の何の予定?` : '何の予定?'
+      } else if (missingTime) {
+        parsed.reply = '何時?'
+      }
+      parsed.mode = 'execute'
+      parsed.options = []
+    }
   }
 
   // ============================================================
