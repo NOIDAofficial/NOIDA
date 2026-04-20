@@ -931,6 +931,9 @@ async function performPreLLMAnalysis(
       .replace(/\d{1,2}:\d{2}/g, '')
       .replace(/\d{1,2}月\d{1,2}日/g, '')
       .replace(/仮で|一旦|とりあえず|暫定/g, '')
+      // ★v2.1.8 Bug Q: 時間未定表現 + 付帯語を除去
+      .replace(/時間未定|時刻未定|時間(は)?まだ|時間(は)?決まって(いない|ない)|時間後で|あとで時間/g, '')
+      .replace(/あるんだけど|あるんですけど|あるんだが|あるけど|あるよ/g, '')
       .replace(/の予定|予定|入れて|追加して|追加|入れといて|記録して/g, '')
       .replace(/[のはに、。]/g, '')
       .trim()
@@ -944,26 +947,6 @@ async function performPreLLMAnalysis(
     signals.has_family_context ||
     signals.has_appointment_context ||
     (!!extractedTitle && !VAGUE_TOPICS.test(extractedTitle))
-  
-  // ★v2.1.7 DEBUG: extractedTitle の実体を徹底追跡
-  const codesOf = (s: string | null): string[] | null => {
-    if (!s) return null
-    const codes: string[] = []
-    for (let i = 0; i < s.length; i++) {
-      codes.push(s.charCodeAt(i).toString(16))
-    }
-    return codes
-  }
-  console.log('🐛 [v2.1.7 TITLE DEBUG]', {
-    raw_text: text,
-    raw_text_json: JSON.stringify(text),
-    raw_text_codes: codesOf(text)?.slice(0, 20),
-    extractedTitle,
-    extractedTitle_json: JSON.stringify(extractedTitle),
-    extractedTitle_codes: codesOf(extractedTitle),
-    vague_test: extractedTitle ? VAGUE_TOPICS.test(extractedTitle) : null,
-    hasExplicitTitle_calc: hasExplicitTitle,
-  })
   
   const shouldDetectConflict = isCalendarAdd && hasExplicitTitle
   
@@ -2161,8 +2144,10 @@ function normalizeCalendarTitle(rawTitle: string): string {
     .replace(/\d{1,2}時半/g, '')
     .replace(/\d{1,2}時/g, '')
     .replace(/\d{1,2}:\d{2}/g, '')
+    // ★v2.1.8 Bug Q: 時間未定表現 + 付帯語を除去
+    .replace(/時間未定|時刻未定|時間(は)?まだ|時間(は)?決まって(いない|ない)|時間後で|あとで時間/g, '')
+    .replace(/あるんだけど|あるんですけど|あるんだが|あるけど|あるよ|ある/g, '')
     // ★v2.1.3 Bug P 修正: LLM が title に「半」だけ残した場合の除去
-    //   例:LLM が「14時半」を「14時」と「半」に分けて、"半打ち合わせ" と save してくる
     .replace(/^半/, '')
     // 助詞(時刻・日付が除去された後の「に」「の」「から」を除去)
     .replace(/^に/, '')
