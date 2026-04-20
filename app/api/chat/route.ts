@@ -14,10 +14,38 @@ import {
 import { correctInput } from '@/lib/analyzer/inputCorrector'
 
 /**
- * NOIDA route.ts v1.7.0 (Phase 1 Day 7 - 仮予定システム + State2受諾応答)
+ * NOIDA route.ts v1.7.2 (Phase 1 Day 7 - 観測可能性 + Silent Failure 撲滅)
  *
  * ============================================================
- * 設計原則
+ * v1.7.2 の追加内容(v1.7.1 からの差分)
+ * ============================================================
+ *
+ * 【根本原則】
+ *   "Don't guess, measure." — 推測するな、計測せよ(シリコンバレー流)
+ *
+ * 【Silent Failure 撲滅】
+ *   全ての Supabase INSERT / UPDATE に error チェックを追加。
+ *   失敗が成功と区別できない状態を解消する。
+ *
+ * 【観測可能性(Observability)】
+ *   - LLM の生レスポンスを [LLM RAW] としてログ出力
+ *   - parsed.save 内容を [PARSED SAVE] としてログ出力
+ *   - INSERT 成否を ✅/❌ としてログ出力
+ *   - ACK 検出入口に文字コード含めてログ
+ *   - correctInput 結果が未訂正でも明示ログ
+ *
+ * 【救済】
+ *   classifyIntent の正規表現境界修正(「案」→「案件」誤マッチ解消)
+ *   レスポンスに mutation.save_result を追加(クライアントで可視化)
+ *
+ * 触らないもの(v1.8.0 で対応):
+ *   - OpenAI Structured Outputs 切替
+ *   - systemPrompt の Few-shot化
+ *   - Plan/Commit アーキテクチャ分離
+ *   - talk_master の 3列化
+ *
+ * ============================================================
+ * 既存の設計原則(v1.7.1 から継承)
  * ============================================================
  *
  * 【原則1: DB真実(Database Truth)】
@@ -34,29 +62,21 @@ import { correctInput } from '@/lib/analyzer/inputCorrector'
  *
  * 【原則5: 誤字許容 × 学習(v1.5.1で確立)】
  *   3層訂正(辞書→個人辞書→LLM推論)で誤字を吸収。
- *   使うほど Takuma の入力クセを学ぶ。
+ *
+ * 【原則10: シリコンバレー大手クオリティ(v1.7.2で確立)】
+ *   妥協・付け焼き刃・見た目だけの修正は禁止。
+ *   根本解決・設計原則遵守・監査証跡完全・Least Privilege。
  *
  * ============================================================
  * 変更履歴
  * ============================================================
- * v1.1: Phase 0 基本機能
- * v1.2: session_date + トピック切り替え
- * v1.3: Entity Resolution + MutationPlan(未熟)
- * v1.4: DB真実原則 + 実行先行フロー
- * v1.4.1: restore検索範囲拡張 + 単独候補自動実行
- * v1.4.2: isOnlyCandidate 判定を有意スコア候補数に修正
- * v1.5: analyzeQuery + Personal Dictionary + Person Matcher 統合
- * v1.5.1: RLS修正 + 3層入力訂正 + 誤字学習システム
- * v1.6.1: pending_confirmation + /api/noida/confirm (auto_execute基盤)
- * v1.6.2: mutation_event_log + Undoボタン表示
- * v1.6.3: mutation_event_log INSERT堅牢化 + 詳細ログ
- * v1.6.4: ゴミ値バリデーション層2(cleanSaveValue)
- * v1.6.5: 受諾ワード→能動応答(State 2 秘書哲学)
- * v1.7.0: ★仮予定システム(Tentative Event)★
- *   - 情報不足(誰と/何の)の予定は is_tentative=true で保存
- *   - 同時間帯に既存予定がある場合は「同じ?違う?」をユーザーに確認
- *   - 「同じ」なら既存仮予定を確定(UPDATE)、「違う」なら別件として併存
- *   - ACK処理で【仮】表示と詳細催促も統合
+ * v1.1 〜 v1.7.1 : 省略(Part1 資料参照)
+ * v1.7.2: 観測可能性 + Silent Failure 撲滅
+ *   - 全 Supabase 書込に error チェック
+ *   - LLM 応答の生ログ [LLM RAW] / [PARSED SAVE]
+ *   - ACK 検出の入口ログ(文字コード付き)
+ *   - classifyIntent の「案」境界修正
+ *   - レスポンスに save_result 追加
  */
 
 const supabase = createClient(
@@ -156,6 +176,18 @@ type ExecutionResult =
   | {
       status: 'not_applicable'
     }
+
+// v1.7.2: save結果の観測可能性のための型
+type SaveEntityResult = {
+  table: string
+  attempted: boolean
+  success: boolean
+  id?: string
+  role?: string
+  error_code?: string
+  error_message?: string
+  skipped_reason?: string
+}
 
 // ============================================================
 // パターン定義
@@ -400,7 +432,10 @@ function classifyIntent(
   if (detectModifyAction(text)) return 'modify'
   if (/(情報|検索|一覧|調べて|探して)/.test(text)) return 'research'
   if (/(どうする|どっち|決めて|どれがいい|どれにする)/.test(text)) return 'decide'
-  if (/(どう思う|考えて|アイデア|壁打ち|案|提案)/.test(text)) return 'explore'
+  // ★v1.7.2: 「案」の正規表現境界修正 — 「案件」「提案」「図案」への誤マッチ解消
+  //   旧: /(案)/ → 「案件」にヒットして誤って explore になる
+  //   新: 単独の「案」または「案を」「案だ」など末尾形のみ、かつ「案件」「提案」の一部ではない
+  if (/(どう思う|考えて|アイデア|壁打ち|提案して|(?<![一-龯々])案(?![件内内外])|草案|私案)/.test(text)) return 'explore'
   if (/(何|なに|なぜ|意味|とは|教えて|って何|どういう)/.test(text)) return 'answer'
   if (/(して|やって|送って|返して|作って)/.test(text)) return 'execute'
   if (keywords.people.length || keywords.businesses.length) return 'decide'
@@ -427,7 +462,10 @@ function detectPreviousEmpathy(messages: any[]): boolean {
 // ============================================================
 
 async function fetchOwnerMaster() {
-  const { data } = await supabase.from('owner_master').select('*').limit(1).single()
+  const { data, error } = await supabase.from('owner_master').select('*').limit(1).single()
+  if (error && error.code !== 'PGRST116') {
+    console.error('❌ [v1.7.2] owner_master 取得エラー:', error)
+  }
   return data ?? null
 }
 
@@ -439,7 +477,8 @@ async function fetchMemory(
 
   if (keywords.people.length > 0) {
     const name = keywords.people[0]
-    const { data } = await supabase.from('people').select('*').ilike('name', `%${name}%`).limit(1)
+    const { data, error } = await supabase.from('people').select('*').ilike('name', `%${name}%`).limit(1)
+    if (error) console.error('❌ [v1.7.2] people 検索エラー:', error)
     if (data?.length) {
       const p = data[0]
       memory.push(
@@ -450,11 +489,12 @@ async function fetchMemory(
 
   if (keywords.businesses.length > 0 && memory.length < 3) {
     const name = keywords.businesses[0]
-    const { data } = await supabase
+    const { data, error } = await supabase
       .from('business_master')
       .select('*')
       .ilike('name', `%${name}%`)
       .limit(1)
+    if (error) console.error('❌ [v1.7.2] business_master 検索エラー:', error)
     if (data?.length) {
       const b = data[0]
       memory.push(`【事業】${b.name}(${b.status || '進行中'})${b.note ? '詳細:' + b.note : ''}`)
@@ -462,25 +502,27 @@ async function fetchMemory(
   }
 
   if (memory.length < 3 && (intent === 'decide' || intent === 'generic' || intent === 'execute')) {
-    const { data } = await supabase
+    const { data, error } = await supabase
       .from('task')
       .select('*')
       .eq('done', false)
       .is('deleted_at', null)
       .order('created_at', { ascending: true })
       .limit(2)
+    if (error) console.error('❌ [v1.7.2] task 検索エラー:', error)
     if (data?.length) {
       memory.push(`【未完了タスク】${data.map((t: any) => t.content).join(' / ')}`)
     }
   }
 
   if (memory.length < 3 && (intent === 'decide' || intent === 'generic')) {
-    const { data } = await supabase
+    const { data, error } = await supabase
       .from('calendar')
       .select('*')
       .is('deleted_at', null)
       .order('created_at', { ascending: false })
       .limit(1)
+    if (error) console.error('❌ [v1.7.2] calendar 検索エラー:', error)
     if (data?.length) {
       memory.push(`【予定】${data[0].title}`)
     }
@@ -490,7 +532,7 @@ async function fetchMemory(
 }
 
 async function fetchPendingFeedback() {
-  const { data } = await supabase
+  const { data, error } = await supabase
     .from('feedback_queue')
     .select('id, decision_log_id, decision_log:decision_log_id(decision_text)')
     .eq('asked', false)
@@ -498,38 +540,28 @@ async function fetchPendingFeedback() {
     .order('created_at', { ascending: true })
     .limit(1)
     .maybeSingle()
+  if (error) console.error('❌ [v1.7.2] feedback_queue 取得エラー:', error)
   return data ?? null
 }
 
 async function recordFeedback(queueId: string, decisionLogId: string, done: boolean) {
-  await supabase
+  const { error: e1 } = await supabase
     .from('decision_log')
     .update({ action_taken: done ? 'done' : 'skipped', updated_at: new Date().toISOString() })
     .eq('id', decisionLogId)
-  await supabase
+  if (e1) console.error('❌ [v1.7.2] decision_log 更新エラー:', e1)
+
+  const { error: e2 } = await supabase
     .from('feedback_queue')
     .update({ asked: true, answered: true })
     .eq('id', queueId)
+  if (e2) console.error('❌ [v1.7.2] feedback_queue 更新エラー:', e2)
 }
 
 // ============================================================
 // ★ v1.5: Entity Resolution 層
 // ============================================================
 
-/**
- * 候補のスコアリング v1.5
- * 
- * シグナル重み:
- *   Personal Dictionary 一致:  +0.60  ★最強
- *   Person Matcher confident:  +0.55
- *   Person Matcher likely:     +0.40
- *   Organizations 一致:        +0.40
- *   Proper Nouns 一致:         +0.35
- *   Keywords 一致(各):         +0.25
- *   Datetime 一致(calendar):   +0.50
- *   Recency:                    +0.05-0.25
- *   State 減点:                 x0.1-0.3
- */
 function scoreCandidate(
   candidate: any,
   text: string,
@@ -623,7 +655,7 @@ function scoreCandidate(
     }
   }
   
-  // 6. Keywords 一致(★パンのタスク問題を解決する箇所)
+  // 6. Keywords 一致
   let keywordMatchCount = 0
   const matchedKeywords: string[] = []
   for (const kw of analysis.keywords) {
@@ -682,9 +714,6 @@ function scoreCandidate(
   }
 }
 
-/**
- * v1.5: Entity Resolution
- */
 async function resolveReference(
   text: string,
   targetTable: TargetTable,
@@ -713,7 +742,8 @@ async function resolveReference(
           .neq('state', 'completed')
           .neq('state', 'cancelled')
       }
-      const { data } = await query
+      const { data, error } = await query
+      if (error) console.error('❌ [v1.7.2] resolveReference/task エラー:', error)
       candidates = data || []
     } else if (targetTable === 'calendar') {
       let query = supabase
@@ -725,25 +755,28 @@ async function resolveReference(
       if (!includeDeletedAndDone) {
         query = query.is('deleted_at', null)
       }
-      const { data } = await query
+      const { data, error } = await query
+      if (error) console.error('❌ [v1.7.2] resolveReference/calendar エラー:', error)
       candidates = data || []
     } else if (targetTable === 'memo') {
-      const { data } = await supabase
+      const { data, error } = await supabase
         .from('memo')
         .select('*')
         .order('created_at', { ascending: false })
         .limit(30)
+      if (error) console.error('❌ [v1.7.2] resolveReference/memo エラー:', error)
       candidates = data || []
     } else if (targetTable === 'ideas') {
-      const { data } = await supabase
+      const { data, error } = await supabase
         .from('ideas')
         .select('*')
         .order('created_at', { ascending: false })
         .limit(30)
+      if (error) console.error('❌ [v1.7.2] resolveReference/ideas エラー:', error)
       candidates = data || []
     }
   } catch (e) {
-    console.log('❌ resolveReference エラー:', e)
+    console.error('❌ [v1.7.2] resolveReference 例外:', e)
   }
 
   if (candidates.length === 0) {
@@ -757,7 +790,6 @@ async function resolveReference(
     }
   }
 
-  // v1.5: analyzeQuery + Personal Dictionary + Person Matcher を先に呼ぶ
   const analysis = analyzeQuery(text)
   const personalMatches = await matchPersonalEntities(text)
   const personMatch = await matchPerson(text)
@@ -786,7 +818,6 @@ async function resolveReference(
   scored.sort((a, b) => b.score - a.score)
   const top = scored[0]
 
-  // Strategy判定
   let strategy: MutationPlan['resolver_strategy'] = 'recency'
   const hasDate = /(\d{1,2})[月\/](\d{1,2})/.test(text)
   const hasProperNoun = /([一-龯ぁ-んァ-ンA-Za-z]{2,})(さん|会長|社長|庁|省|部|課|店|所|会社)/.test(text)
@@ -801,7 +832,6 @@ async function resolveReference(
   const confidence = top.score
   const scoreGap = scored.length > 1 ? top.score - scored[1].score : 1.0
 
-  // 有意味なスコア(0.3以上)を持つ候補が1件だけなら自動実行
   const significantCandidates = scored.filter(s => s.score >= 0.3)
   const isOnlyCandidate = significantCandidates.length === 1 && top.score >= 0.3
 
@@ -823,9 +853,6 @@ async function resolveReference(
   }
 }
 
-/**
- * v1.4: MutationPlan 生成
- */
 async function generateMutationPlan(
   text: string,
   action: ModifyAction,
@@ -840,61 +867,25 @@ async function generateMutationPlan(
 
   if (targetTable === 'task') {
     if (action === 'complete') {
-      patch = {
-        state: 'completed',
-        done: true,
-        completed_at: nowISO,
-        updated_at: nowISO,
-      }
+      patch = { state: 'completed', done: true, completed_at: nowISO, updated_at: nowISO }
     } else if (action === 'cancel') {
-      patch = {
-        state: 'cancelled',
-        cancelled_at: nowISO,
-        updated_at: nowISO,
-      }
+      patch = { state: 'cancelled', cancelled_at: nowISO, updated_at: nowISO }
     } else if (action === 'pause') {
-      patch = {
-        state: 'paused',
-        updated_at: nowISO,
-      }
+      patch = { state: 'paused', updated_at: nowISO }
     } else if (action === 'restore') {
-      patch = {
-        state: 'active',
-        done: false,
-        completed_at: null,
-        cancelled_at: null,
-        updated_at: nowISO,
-      }
+      patch = { state: 'active', done: false, completed_at: null, cancelled_at: null, updated_at: nowISO }
     } else if (action === 'delete') {
-      patch = {
-        deleted_at: nowISO,
-        updated_at: nowISO,
-      }
+      patch = { deleted_at: nowISO, updated_at: nowISO }
     }
   } else if (targetTable === 'calendar') {
     if (action === 'complete') {
-      patch = {
-        state: 'completed',
-        completed_at: nowISO,
-        updated_at: nowISO,
-      }
+      patch = { state: 'completed', completed_at: nowISO, updated_at: nowISO }
     } else if (action === 'cancel') {
-      patch = {
-        state: 'cancelled',
-        cancelled_at: nowISO,
-        updated_at: nowISO,
-      }
+      patch = { state: 'cancelled', cancelled_at: nowISO, updated_at: nowISO }
     } else if (action === 'restore') {
-      patch = {
-        state: 'scheduled',
-        cancelled_at: null,
-        updated_at: nowISO,
-      }
+      patch = { state: 'scheduled', cancelled_at: null, updated_at: nowISO }
     } else if (action === 'delete') {
-      patch = {
-        deleted_at: nowISO,
-        updated_at: nowISO,
-      }
+      patch = { deleted_at: nowISO, updated_at: nowISO }
     }
   } else if (targetTable === 'memo' || targetTable === 'ideas') {
     if (action === 'delete') {
@@ -929,9 +920,6 @@ async function generateMutationPlan(
   }
 }
 
-/**
- * v1.4: MutationPlan を実行
- */
 async function executeMutationPlan(
   plan: MutationPlan,
   userMessageId: string
@@ -961,6 +949,7 @@ async function executeMutationPlan(
       .single()
 
     if (beforeError || !before) {
+      console.error('❌ [v1.7.2] executeMutationPlan: target取得エラー', beforeError)
       return {
         status: 'error',
         error: 'target_not_found_at_execution',
@@ -983,7 +972,7 @@ async function executeMutationPlan(
       })
 
       if (trashError) {
-        console.log('⚠️ trash_queue INSERTエラー:', trashError)
+        console.error('⚠️ [v1.7.2] trash_queue INSERTエラー:', trashError)
       }
 
       if (plan.target_table === 'memo' || plan.target_table === 'ideas') {
@@ -992,6 +981,7 @@ async function executeMutationPlan(
           .delete()
           .eq('id', plan.target_id)
         if (error) {
+          console.error('❌ [v1.7.2] delete エラー:', error)
           return { status: 'error', error: error.message, action: plan.action }
         }
       } else {
@@ -1000,6 +990,7 @@ async function executeMutationPlan(
           .update({ deleted_at: new Date().toISOString() })
           .eq('id', plan.target_id)
         if (error) {
+          console.error('❌ [v1.7.2] soft-delete エラー:', error)
           return { status: 'error', error: error.message, action: plan.action }
         }
       }
@@ -1009,6 +1000,7 @@ async function executeMutationPlan(
         .update(plan.patch)
         .eq('id', plan.target_id)
       if (error) {
+        console.error('❌ [v1.7.2] update エラー:', error)
         return { status: 'error', error: error.message, action: plan.action }
       }
     }
@@ -1017,7 +1009,7 @@ async function executeMutationPlan(
       (plan.target_table === 'task' || plan.target_table === 'calendar') &&
       plan.patch.state
     ) {
-      await supabase.from('living_record_state_transition').insert({
+      const { error: stError } = await supabase.from('living_record_state_transition').insert({
         source_table: plan.target_table,
         source_id: plan.target_id,
         from_state: before.state || 'active',
@@ -1029,6 +1021,7 @@ async function executeMutationPlan(
         version: (before.version || 1) + 1,
         effective_from: new Date().toISOString(),
       })
+      if (stError) console.error('⚠️ [v1.7.2] state_transition INSERT エラー:', stError)
     }
 
     let after: any = null
@@ -1041,7 +1034,6 @@ async function executeMutationPlan(
       after = data
     }
 
-    // v1.6.3: mutation_event_log INSERT 堅牢化(詳細ログ付き)
     const { error: mutLogError } = await supabase.from('mutation_event_log').insert({
       user_message_id: userMessageId,
       event_type: plan.action,
@@ -1057,7 +1049,7 @@ async function executeMutationPlan(
       idempotency_key: plan.idempotency_key,
     })
     if (mutLogError) {
-      console.log('⚠️ [v1.6.3] mutation_event_log INSERT エラー:', {
+      console.error('⚠️ [v1.7.2] mutation_event_log INSERT エラー:', {
         code: mutLogError.code,
         message: mutLogError.message,
         details: mutLogError.details,
@@ -1065,7 +1057,7 @@ async function executeMutationPlan(
       })
     }
 
-    await supabase.from('entity_reference_resolution_log').insert({
+    const { error: erResErr } = await supabase.from('entity_reference_resolution_log').insert({
       user_message_id: userMessageId,
       reference_text: plan.target_title || '(unknown)',
       target_table: plan.target_table,
@@ -1075,6 +1067,7 @@ async function executeMutationPlan(
       confidence: plan.confidence,
       user_confirmed: !plan.requires_confirmation,
     })
+    if (erResErr) console.error('⚠️ [v1.7.2] entity_reference_resolution_log INSERT エラー:', erResErr)
 
     return {
       status: 'executed',
@@ -1085,7 +1078,7 @@ async function executeMutationPlan(
       after_state: (plan.patch.state as string) || (plan.action === 'delete' ? 'deleted' : null),
     }
   } catch (e: any) {
-    console.log('❌ executeMutationPlan 例外:', e)
+    console.error('❌ [v1.7.2] executeMutationPlan 例外:', e)
     return {
       status: 'error',
       error: e.message || 'unknown',
@@ -1093,10 +1086,6 @@ async function executeMutationPlan(
     }
   }
 }
-
-// ============================================================
-// ここまで v1.5 核心部分
-// ============================================================
 
 async function saveDecision(sourceMessage: string, intent: Intent, parsed: any, owner: any) {
   const LOGGABLE_INTENTS = ['execute', 'decide', 'objection', 'non_intervention', 'modify']
@@ -1122,30 +1111,24 @@ async function saveDecision(sourceMessage: string, intent: Intent, parsed: any, 
     .single()
 
   if (error || !data) {
-    console.log('❌ decision_log 記録失敗:', error)
+    console.error('❌ [v1.7.2] decision_log 記録失敗:', error)
     return
   }
 
   if (intent === 'objection' || intent === 'non_intervention') return
 
   const askAfter = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString()
-  await supabase.from('feedback_queue').insert({
+  const { error: fqError } = await supabase.from('feedback_queue').insert({
     decision_log_id: data.id,
     ask_after: askAfter,
   })
+  if (fqError) console.error('❌ [v1.7.2] feedback_queue INSERT 失敗:', fqError)
 }
-
-
 
 // ============================================================
 // v1.7.0: 仮予定システム - 重複検出と解決
 // ============================================================
 
-/**
- * 同時間帯の既存予定を検出
- * @param datetime ISO文字列
- * @param windowMinutes 前後の許容範囲(分)
- */
 async function checkConflictingEvents(
   datetime: string,
   windowMinutes: number = 60
@@ -1155,7 +1138,7 @@ async function checkConflictingEvents(
     const windowStart = new Date(target.getTime() - windowMinutes * 60 * 1000)
     const windowEnd = new Date(target.getTime() + windowMinutes * 60 * 1000)
 
-    const { data } = await supabase
+    const { data, error } = await supabase
       .from('calendar')
       .select('*')
       .is('deleted_at', null)
@@ -1164,16 +1147,14 @@ async function checkConflictingEvents(
       .lte('datetime', windowEnd.toISOString())
       .order('datetime', { ascending: true })
 
+    if (error) console.error('❌ [v1.7.2] checkConflictingEvents エラー:', error)
     return data || []
   } catch (e) {
-    console.log('❌ checkConflictingEvents エラー:', e)
+    console.error('❌ [v1.7.2] checkConflictingEvents 例外:', e)
     return []
   }
 }
 
-/**
- * 予定の不足情報を判定
- */
 function detectMissingFields(
   title: string,
   peopleName: string | null | undefined
@@ -1184,12 +1165,9 @@ function detectMissingFields(
   return missingFields
 }
 
-/**
- * 直近の calendar_conflict pending を取得
- */
 async function fetchLatestCalendarConflict(): Promise<any | null> {
   try {
-    const { data } = await supabase
+    const { data, error } = await supabase
       .from('pending_confirmation')
       .select('*')
       .eq('action', 'resolve_calendar_conflict')
@@ -1198,40 +1176,40 @@ async function fetchLatestCalendarConflict(): Promise<any | null> {
       .order('created_at', { ascending: false })
       .limit(1)
       .maybeSingle()
+    if (error) console.error('❌ [v1.7.2] fetchLatestCalendarConflict エラー:', error)
     return data ?? null
   } catch (e) {
-    console.log('❌ fetchLatestCalendarConflict エラー:', e)
+    console.error('❌ [v1.7.2] fetchLatestCalendarConflict 例外:', e)
     return null
   }
 }
 
-/**
- * 仮予定を確定(missing_fields を埋める)
- */
 async function confirmTentativeCalendar(
   existingId: string,
   newTitle: string,
   newPeopleName: string | null | undefined
 ): Promise<void> {
   try {
-    const { data: current } = await supabase
+    const { data: current, error: getError } = await supabase
       .from('calendar')
       .select('missing_fields, title')
       .eq('id', existingId)
       .single()
 
+    if (getError) {
+      console.error('❌ [v1.7.2] confirmTentativeCalendar 取得エラー:', getError)
+      return
+    }
     if (!current) return
 
     const updates: any = {
       updated_at: new Date().toISOString(),
     }
 
-    // title を更新(新しい方が具体的)
     if (newTitle && !VAGUE_TOPICS.test(newTitle.trim())) {
       updates.title = newTitle
     }
 
-    // missing_fields から該当を削除
     let remaining: string[] = current.missing_fields || []
     if (newPeopleName) {
       remaining = remaining.filter((f: string) => f !== 'people')
@@ -1247,16 +1225,19 @@ async function confirmTentativeCalendar(
       updates.missing_fields = remaining
     }
 
-    await supabase.from('calendar').update(updates).eq('id', existingId)
-    console.log('✅ [v1.7.0] 仮予定を確定:', existingId, updates)
+    const { error: upError } = await supabase.from('calendar').update(updates).eq('id', existingId)
+    if (upError) {
+      console.error('❌ [v1.7.2] confirmTentativeCalendar UPDATE エラー:', upError)
+      return
+    }
+    console.log('✅ [v1.7.2] 仮予定を確定:', existingId, updates)
   } catch (e) {
-    console.log('❌ confirmTentativeCalendar エラー:', e)
+    console.error('❌ [v1.7.2] confirmTentativeCalendar 例外:', e)
   }
 }
 
 // ============================================================
 // v1.6.4: ゴミ値排除ヘルパー(LLM幻覚対策・層2)
-// 「(省略可)」「null」「なし」等のメタ値がDBに流入するのを防ぐ
 // ============================================================
 const INVALID_SAVE_VALUES = new Set([
   'null', 'undefined', 'NULL', 'None', 'none',
@@ -1270,7 +1251,6 @@ const INVALID_SAVE_VALUES = new Set([
 
 function cleanSaveValue(value: any): any {
   if (value === null || value === undefined) return null
-  // オブジェクト型(people/business等)はそのまま返す
   if (typeof value !== 'string') return value
   const trimmed = value.trim()
   if (!trimmed) return null
@@ -1279,18 +1259,15 @@ function cleanSaveValue(value: any): any {
     return null
   }
   // ★v1.7.1: ISO 8601 形式を title として保存するのを防ぐ
-  //   LLM が save.calendar: "2026-04-21T14:00:00" のように返すことがあるため
   const ISO_DATETIME_PATTERN = /^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?)?$/
   if (ISO_DATETIME_PATTERN.test(trimmed)) {
     console.log('⚠️ [v1.7.1] ISO 8601 形式を検出してスキップ:', trimmed)
     return null
   }
-  // 括弧だけで始まる文字列はメタ注釈の可能性が高い
   if (trimmed.startsWith('(') && trimmed.endsWith(')')) {
     console.log('⚠️ [v1.6.4] 括弧メタ注釈を検出してスキップ:', trimmed)
     return null
   }
-  // 「省略可」「省略する」を含む文字列を強く疑う
   if (trimmed.includes('省略可') || trimmed.includes('省略する')) {
     console.log('⚠️ [v1.6.4] 省略関連の語を検出してスキップ:', trimmed)
     return null
@@ -1298,21 +1275,38 @@ function cleanSaveValue(value: any): any {
   return trimmed
 }
 
-async function saveStructuredMemory(save: any, rawText: string, userMessageId: string) {
-  if (!save) return
+/**
+ * ★v1.7.2: saveStructuredMemory が観測可能な結果を返すように変更
+ * 各エンティティの INSERT 試行/成否/理由を SaveEntityResult[] として返す
+ */
+async function saveStructuredMemory(
+  save: any,
+  rawText: string,
+  userMessageId: string
+): Promise<SaveEntityResult[]> {
+  const results: SaveEntityResult[] = []
+  if (!save) {
+    console.log('📦 [v1.7.2 SAVE] save オブジェクトが null/undefined')
+    return results
+  }
+
+  console.log('📦 [v1.7.2 SAVE] 入口の save 内容:', JSON.stringify(save))
 
   const extractedEntities: Array<{ table: string; id: string; role: string }> = []
 
+  // ---------- task ----------
   const cleanTask = cleanSaveValue(save.task)
   if (cleanTask) {
-    const { data: existing } = await supabase
+    const { data: existing, error: existErr } = await supabase
       .from('task')
       .select('id')
       .eq('content', cleanTask)
       .is('deleted_at', null)
       .limit(1)
+    if (existErr) console.error('❌ [v1.7.2] task 既存検索エラー:', existErr)
+
     if (!existing?.length) {
-      const { data: inserted } = await supabase
+      const { data: inserted, error: insErr } = await supabase
         .from('task')
         .insert({
           content: cleanTask,
@@ -1323,42 +1317,71 @@ async function saveStructuredMemory(save: any, rawText: string, userMessageId: s
         })
         .select('id')
         .single()
-      if (inserted) {
+
+      if (insErr) {
+        console.error('❌ [v1.7.2] task INSERT エラー:', insErr)
+        results.push({
+          table: 'task', attempted: true, success: false,
+          error_code: insErr.code, error_message: insErr.message,
+        })
+      } else if (inserted) {
+        console.log('✅ [v1.7.2] task INSERT 成功:', inserted.id)
         extractedEntities.push({ table: 'task', id: inserted.id, role: 'created' })
+        results.push({ table: 'task', attempted: true, success: true, id: inserted.id, role: 'created' })
       }
+    } else {
+      results.push({ table: 'task', attempted: true, success: true, skipped_reason: 'already_exists' })
     }
+  } else if (save.task !== null && save.task !== undefined) {
+    results.push({ table: 'task', attempted: true, success: false, skipped_reason: 'cleaned_to_null', error_message: String(save.task) })
   }
 
+  // ---------- memo ----------
   const cleanMemo = cleanSaveValue(save.memo)
   if (cleanMemo) {
-    const { data: inserted } = await supabase
+    const { data: inserted, error: insErr } = await supabase
       .from('memo')
       .insert({ content: cleanMemo })
       .select('id')
       .single()
-    if (inserted) {
+    if (insErr) {
+      console.error('❌ [v1.7.2] memo INSERT エラー:', insErr)
+      results.push({ table: 'memo', attempted: true, success: false, error_code: insErr.code, error_message: insErr.message })
+    } else if (inserted) {
+      console.log('✅ [v1.7.2] memo INSERT 成功:', inserted.id)
       extractedEntities.push({ table: 'memo', id: inserted.id, role: 'created' })
+      results.push({ table: 'memo', attempted: true, success: true, id: inserted.id, role: 'created' })
     }
+  } else if (save.memo !== null && save.memo !== undefined) {
+    results.push({ table: 'memo', attempted: true, success: false, skipped_reason: 'cleaned_to_null', error_message: String(save.memo) })
   }
 
+  // ---------- calendar ----------
   const cleanCalendar = cleanSaveValue(save.calendar)
   if (cleanCalendar) {
     const extracted = extractDatetime(rawText)
     const peopleName = save.people?.name ? normalizeName(save.people.name) : null
 
-    // v1.7.0: 仮予定判定
+    console.log('📦 [v1.7.2 SAVE] calendar 処理開始:', {
+      cleanCalendar,
+      extracted_datetime: extracted?.datetime,
+      peopleName,
+    })
+
     const missingFields = detectMissingFields(cleanCalendar, peopleName)
     const isTentative = missingFields.length > 0
 
-    // v1.7.0: 重複検出(datetime がある場合のみ)
     let conflictDetected = false
     if (extracted?.datetime) {
       const conflicts = await checkConflictingEvents(extracted.datetime, 60)
+      console.log('📦 [v1.7.2 SAVE] 重複検出結果:', {
+        checked_datetime: extracted.datetime,
+        conflicts_count: conflicts.length,
+      })
 
       if (conflicts.length > 0) {
-        // 既存予定と重複 → pending_confirmation に登録してユーザー判断を仰ぐ
         const conflict = conflicts[0]
-        const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString() // 10分有効
+        const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString()
 
         const { error: pcError } = await supabase.from('pending_confirmation').insert({
           user_message_id: userMessageId,
@@ -1398,18 +1421,20 @@ async function saveStructuredMemory(save: any, rawText: string, userMessageId: s
         })
 
         if (pcError) {
-          console.log('⚠️ [v1.7.0] pending_confirmation INSERT エラー:', pcError)
-          // 失敗したら通常INSERTにフォールバック
+          console.error('❌ [v1.7.2] pending_confirmation INSERT エラー:', pcError)
+          results.push({ table: 'pending_confirmation', attempted: true, success: false, error_code: pcError.code, error_message: pcError.message })
         } else {
-          console.log('🔔 [v1.7.0] 予定重複検出、ユーザー確認待ち:', conflict.id)
+          console.log('🔔 [v1.7.2] 予定重複検出、ユーザー確認待ち:', conflict.id)
           conflictDetected = true
+          results.push({ table: 'pending_confirmation', attempted: true, success: true, role: 'calendar_conflict_pending' })
         }
       }
+    } else {
+      console.log('📦 [v1.7.2 SAVE] datetime抽出失敗 — 重複検出をスキップ')
     }
 
-    // 重複なし → 通常INSERT(仮予定 or 確定予定として)
     if (!conflictDetected) {
-      const { data: inserted } = await supabase
+      const { data: inserted, error: insErr } = await supabase
         .from('calendar')
         .insert({
           title: cleanCalendar,
@@ -1422,24 +1447,57 @@ async function saveStructuredMemory(save: any, rawText: string, userMessageId: s
         })
         .select('id')
         .single()
-      if (inserted) {
+
+      if (insErr) {
+        console.error('❌ [v1.7.2] calendar INSERT エラー:', {
+          code: insErr.code,
+          message: insErr.message,
+          details: insErr.details,
+          hint: insErr.hint,
+          payload: {
+            title: cleanCalendar,
+            datetime: extracted?.datetime,
+            is_tentative: isTentative,
+            missing_fields: missingFields,
+          }
+        })
+        results.push({ table: 'calendar', attempted: true, success: false, error_code: insErr.code, error_message: insErr.message })
+      } else if (inserted) {
+        console.log('✅ [v1.7.2] calendar INSERT 成功:', {
+          id: inserted.id,
+          title: cleanCalendar,
+          is_tentative: isTentative,
+        })
         extractedEntities.push({ 
           table: 'calendar', 
           id: inserted.id, 
           role: isTentative ? 'tentative_event' : 'event' 
         })
+        results.push({ 
+          table: 'calendar', attempted: true, success: true, 
+          id: inserted.id, 
+          role: isTentative ? 'tentative_event' : 'event' 
+        })
       }
     }
+  } else if (save.calendar !== null && save.calendar !== undefined) {
+    results.push({ 
+      table: 'calendar', attempted: true, success: false, 
+      skipped_reason: 'cleaned_to_null', 
+      error_message: String(save.calendar) 
+    })
   }
 
+  // ---------- people ----------
   if (save.people?.name) {
     const p = save.people
     const normalizedName = normalizeName(p.name)
-    const { data: candidates } = await supabase
+    const { data: candidates, error: searchErr } = await supabase
       .from('people')
       .select('*')
       .ilike('name', `%${normalizedName}%`)
       .limit(3)
+    if (searchErr) console.error('❌ [v1.7.2] people 検索エラー:', searchErr)
 
     const existing =
       candidates?.find(
@@ -1451,7 +1509,7 @@ async function saveStructuredMemory(save: any, rawText: string, userMessageId: s
 
     if (existing) {
       const nextNote = [existing.note, p.note].filter(Boolean).join('\n')
-      await supabase
+      const { error: upErr } = await supabase
         .from('people')
         .update({
           company: p.company || existing.company,
@@ -1460,9 +1518,16 @@ async function saveStructuredMemory(save: any, rawText: string, userMessageId: s
           updated_at: new Date().toISOString(),
         })
         .eq('id', existing.id)
-      extractedEntities.push({ table: 'people', id: existing.id, role: 'referenced' })
+      if (upErr) {
+        console.error('❌ [v1.7.2] people UPDATE エラー:', upErr)
+        results.push({ table: 'people', attempted: true, success: false, error_code: upErr.code, error_message: upErr.message })
+      } else {
+        console.log('✅ [v1.7.2] people UPDATE 成功(既存紐付け):', existing.id)
+        extractedEntities.push({ table: 'people', id: existing.id, role: 'referenced' })
+        results.push({ table: 'people', attempted: true, success: true, id: existing.id, role: 'referenced' })
+      }
     } else {
-      const { data: inserted } = await supabase
+      const { data: inserted, error: insErr } = await supabase
         .from('people')
         .insert({
           name: normalizedName,
@@ -1473,58 +1538,83 @@ async function saveStructuredMemory(save: any, rawText: string, userMessageId: s
         })
         .select('id')
         .single()
-      if (inserted) {
+      if (insErr) {
+        console.error('❌ [v1.7.2] people INSERT エラー:', insErr)
+        results.push({ table: 'people', attempted: true, success: false, error_code: insErr.code, error_message: insErr.message })
+      } else if (inserted) {
+        console.log('✅ [v1.7.2] people INSERT 成功:', inserted.id)
         extractedEntities.push({ table: 'people', id: inserted.id, role: 'created' })
+        results.push({ table: 'people', attempted: true, success: true, id: inserted.id, role: 'created' })
       }
     }
   }
 
+  // ---------- business ----------
   if (save.business?.name) {
     const b = save.business
-    const { data: existing } = await supabase
+    const { data: existing, error: searchErr } = await supabase
       .from('business_master')
       .select('*')
       .ilike('name', `%${b.name}%`)
       .limit(1)
+    if (searchErr) console.error('❌ [v1.7.2] business 検索エラー:', searchErr)
+
     if (existing?.length) {
-      await supabase
+      const { error: upErr } = await supabase
         .from('business_master')
         .update({
           note: [existing[0].note, b.note].filter(Boolean).join('\n'),
           updated_at: new Date().toISOString(),
         })
         .eq('id', existing[0].id)
-      extractedEntities.push({ table: 'business_master', id: existing[0].id, role: 'referenced' })
+      if (upErr) {
+        console.error('❌ [v1.7.2] business UPDATE エラー:', upErr)
+        results.push({ table: 'business_master', attempted: true, success: false, error_code: upErr.code, error_message: upErr.message })
+      } else {
+        console.log('✅ [v1.7.2] business UPDATE 成功:', existing[0].id)
+        extractedEntities.push({ table: 'business_master', id: existing[0].id, role: 'referenced' })
+        results.push({ table: 'business_master', attempted: true, success: true, id: existing[0].id, role: 'referenced' })
+      }
     } else {
-      const { data: inserted } = await supabase
+      const { data: inserted, error: insErr } = await supabase
         .from('business_master')
         .insert({ name: b.name, note: b.note || null })
         .select('id')
         .single()
-      if (inserted) {
-        extractedEntities.push({
-          table: 'business_master',
-          id: inserted.id,
-          role: 'created',
-        })
+      if (insErr) {
+        console.error('❌ [v1.7.2] business INSERT エラー:', insErr)
+        results.push({ table: 'business_master', attempted: true, success: false, error_code: insErr.code, error_message: insErr.message })
+      } else if (inserted) {
+        console.log('✅ [v1.7.2] business INSERT 成功:', inserted.id)
+        extractedEntities.push({ table: 'business_master', id: inserted.id, role: 'created' })
+        results.push({ table: 'business_master', attempted: true, success: true, id: inserted.id, role: 'created' })
       }
     }
   }
 
+  // ---------- ideas ----------
   const cleanIdeas = cleanSaveValue(save.ideas)
   if (cleanIdeas) {
-    const { data: inserted } = await supabase
+    const { data: inserted, error: insErr } = await supabase
       .from('ideas')
       .insert({ content: cleanIdeas })
       .select('id')
       .single()
-    if (inserted) {
+    if (insErr) {
+      console.error('❌ [v1.7.2] ideas INSERT エラー:', insErr)
+      results.push({ table: 'ideas', attempted: true, success: false, error_code: insErr.code, error_message: insErr.message })
+    } else if (inserted) {
+      console.log('✅ [v1.7.2] ideas INSERT 成功:', inserted.id)
       extractedEntities.push({ table: 'ideas', id: inserted.id, role: 'created' })
+      results.push({ table: 'ideas', attempted: true, success: true, id: inserted.id, role: 'created' })
     }
+  } else if (save.ideas !== null && save.ideas !== undefined) {
+    results.push({ table: 'ideas', attempted: true, success: false, skipped_reason: 'cleaned_to_null', error_message: String(save.ideas) })
   }
 
+  // ---------- entity_extraction_log ----------
   if (extractedEntities.length > 0) {
-    await supabase.from('entity_extraction_log').insert({
+    const { error: extLogErr } = await supabase.from('entity_extraction_log').insert({
       source_message_id: userMessageId,
       source_text: rawText,
       extracted_entities: extractedEntities,
@@ -1532,7 +1622,11 @@ async function saveStructuredMemory(save: any, rawText: string, userMessageId: s
       confidence: 0.85,
       is_user_reviewed: false,
     })
+    if (extLogErr) console.error('⚠️ [v1.7.2] entity_extraction_log INSERT エラー:', extLogErr)
   }
+
+  console.log('📦 [v1.7.2 SAVE] 完了サマリ:', JSON.stringify(results))
+  return results
 }
 
 async function triggerDaytimeBatch() {
@@ -1549,14 +1643,14 @@ async function triggerDaytimeBatch() {
       }
     )
     if (response.ok) console.log('✅ 昼バッチ起動成功')
-    else console.log('❌ 昼バッチ起動失敗:', response.status)
+    else console.error('❌ 昼バッチ起動失敗:', response.status)
   } catch (e) {
-    console.log('❌ バッチ起動エラー:', e)
+    console.error('❌ バッチ起動エラー:', e)
   }
 }
 
 // ============================================================
-// v1.5.1: システムプロンプト(誤字許容原則追加)
+// システムプロンプト(v1.7.1 仕様を維持・v1.8.0 で Few-shot化予定)
 // ============================================================
 
 function buildSystemPrompt(
@@ -1681,12 +1775,8 @@ ${executionResult.action === 'delete' ? '- 削除なので「30日以内なら�
 `
     } else if (executionResult.status === 'needs_confirmation') {
       const actionJpMap: Record<string, string> = {
-        delete: '削除',
-        complete: '完了',
-        cancel: 'キャンセル',
-        pause: '一時停止',
-        update: '更新',
-        restore: '復元',
+        delete: '削除', complete: '完了', cancel: 'キャンセル',
+        pause: '一時停止', update: '更新', restore: '復元',
       }
       const actionJp = actionJpMap[executionResult.action] || executionResult.action
       const candidateList = executionResult.candidates
@@ -1708,12 +1798,8 @@ ${executionResult.action === 'delete' ? '- 削除なので「30日以内なら�
 `
     } else if (executionResult.status === 'no_target_found') {
       const actionJpMap: Record<string, string> = {
-        delete: '削除',
-        complete: '完了',
-        cancel: 'キャンセル',
-        pause: '一時停止',
-        update: '更新',
-        restore: '復元',
+        delete: '削除', complete: '完了', cancel: 'キャンセル',
+        pause: '一時停止', update: '更新', restore: '復元',
       }
       const actionJp = actionJpMap[executionResult.action] || executionResult.action
       executionNote = `
@@ -1822,26 +1908,40 @@ executionNoteの結果に従って正確に報告する。
 【Explore】
 思考・アイデア。2〜3案まで出して最後は1つに収束。
 
-■保存ルール(Modifyモードでは適用されない)
-・calendar: ユーザーが日時・予定を言った時のみ
-  - ★★v1.7.1 絶対禁止★★
-    save.calendar の値に日時形式("2026-04-21T14:00:00" "2026-04-20" など)を入れてはいけない
-    → システムが自動でスキップして保存失敗する
-  - titleは必ず「予定の中身」を自然言語で書く
-    ✅ 良い例: "会議" "田中さんとの新規案件の会議" "病院" "散髪"
-    ❌ 悪い例: "2026-04-21T14:00:00" "2026-04-20" "14:00" "明日14時"
-  - 日時情報は save.calendar に入れず、ユーザー発言から extractDatetime が自動抽出する
-  - 「誰と」や「何の会議か」が曖昧な場合は、"会議" だけ入れればOK(システムが仮予定として扱う)
-  - 仮予定の場合、replyで「詳細分かり次第教えて」「誰と/何か決まったら言って」と促すこと
-・task: ユーザーが明確にタスクを述べた時のみ
+■★保存ルール(極めて重要・Modifyモードでは適用されない)★
+
+★★絶対法則★★
+・ユーザーが「予定」「会議」「タスク」などの情報を言ったら、必ず save.* に自然言語で値を入れる
+・「保存した」「押さえた」「記録した」と reply で言うなら、対応する save.* は必ず埋めること
+・reply と save の整合性は厳守(嘘の成功報告は重大違反)
+
+【save.calendar について】
+・ユーザーが「日時+予定」を言った時は必ず自然言語titleで埋める
+・titleは予定の中身(会議名など)を書く。日時は書かない。
+  ✅ 正解: "会議", "田中さんとの新規案件の会議", "病院", "散髪"
+  ❌ 不正解: "2026-04-21T14:00:00", "2026-04-20", "14:00", "明日14時"
+・情報が不足していても null にしない。曖昧なら "会議" と入れる(システムが仮予定扱いにする)
+・日時情報は save.calendar に入れない(extractDatetime が自動抽出する)
+
+具体例:
+  入力「明日14時に会議」→ save.calendar: "会議"
+  入力「田中さんと打ち合わせ入れて」→ save.calendar: "田中さんとの打ち合わせ"
+  入力「疲れた」→ save.calendar: null(予定と関係ないので)
+
+【save.task について】
+・明確なタスク(やるべきこと)を述べた時のみ自然言語で埋める
+・「〜しないと」「〜やらなきゃ」「〜する必要がある」→ save.task に入れる
+
+【その他】
 ・memo: 「覚えて」「メモして」と言った時のみ
-・people: 人物について言及した時
+・people: 人物について言及した時は name を必ず埋める
 ・business: 明確なビジネス案がある時のみ
 ・ideas: 明確なアイデアがある時のみ
 
 ■★v1.7.0: 仮予定の扱い★
 ユーザーが日時だけ言った予定(例:「明日14時に会議」)は:
-- 誰と/何の会議かが不明 → 仮予定として保存される
+- save.calendar は "会議" と入れる(nullにしない!)
+- システムが自動で仮予定(is_tentative=true)として保存する
 - replyでは「仮予定として押さえた。詳細分かり次第教えて。」と案内する
 - 決めつけで詳細を埋めない(「田中さんかな?」と想像しない)
 
@@ -1882,13 +1982,22 @@ decision_text には「何をすべきか」を動詞で終わる1文で。
 }
 
 // ============================================================
-// ★ v1.5.1 POST関数
+// ★ v1.7.2 POST関数(観測可能性フル搭載)
 // ============================================================
 
 export async function POST(req: NextRequest) {
+  const requestStartTime = Date.now()
   const { messages } = await req.json()
   const rawUserMessage = messages[messages.length - 1]?.content || ''
   const sessionDate = getSessionDate()
+
+  // ★v1.7.2: リクエスト入口ログ
+  console.log('📥 [v1.7.2 REQUEST]', JSON.stringify({
+    raw_message: rawUserMessage,
+    raw_length: rawUserMessage.length,
+    messages_count: messages.length,
+    session_date: sessionDate,
+  }))
   
   // v1.5.1: 入力訂正(3層:辞書→個人辞書→LLM)
   let lastUserMessage = rawUserMessage
@@ -1901,15 +2010,23 @@ export async function POST(req: NextRequest) {
       : null
     
     const correctionResult = await correctInput(rawUserMessage, precedingContext)
+    
+    // ★v1.7.2: correctInput の結果を常にログ
     if (correctionResult.was_corrected) {
-      console.log(`[Input訂正] "${correctionResult.original}" → "${correctionResult.corrected}"`)
-      for (const c of correctionResult.corrections) {
-        console.log(`  - [${c.source}] "${c.from}" → "${c.to}" (${c.pattern_type}, conf=${c.confidence.toFixed(2)})`)
-      }
+      console.log('✏️ [v1.7.2 INPUT訂正]', {
+        original: correctionResult.original,
+        corrected: correctionResult.corrected,
+        corrections: correctionResult.corrections,
+      })
       lastUserMessage = correctionResult.corrected
+    } else {
+      console.log('✏️ [v1.7.2 INPUT訂正]', {
+        original: rawUserMessage,
+        corrected: '(未訂正)',
+      })
     }
   } catch (e) {
-    console.warn('[Input訂正] エラー、訂正せずに処理続行:', e)
+    console.error('❌ [v1.7.2 INPUT訂正] エラー、訂正せずに処理続行:', e)
   }
 
   if (/更新して|整理して|学習して|マスタ更新/.test(lastUserMessage)) {
@@ -1979,40 +2096,48 @@ export async function POST(req: NextRequest) {
     const isSame = CONFLICT_SAME_PATTERNS.test(lastUserMessage.trim())
     const isDifferent = CONFLICT_DIFFERENT_PATTERNS.test(lastUserMessage.trim())
 
+    console.log('🔎 [v1.7.2 CONFLICT] 判定:', {
+      has_conflict: true,
+      isSame,
+      isDifferent,
+      user_input: lastUserMessage.trim(),
+    })
+
     if (isSame || isDifferent) {
       const plan = calendarConflict.mutation_plan as any
       const { existing_id, new_event_data } = plan
 
       if (isSame) {
-        // 既存仮予定を確定(title/people/missing_fields更新)
         await confirmTentativeCalendar(
           existing_id,
           new_event_data.title,
           new_event_data.people_name
         )
 
-        // people が新規提供されていれば people テーブルに記録
         if (new_event_data.people_name) {
-          const { data: existingPerson } = await supabase
+          const { data: existingPerson, error: searchErr } = await supabase
             .from('people')
             .select('id')
             .eq('name', new_event_data.people_name)
             .limit(1)
             .maybeSingle()
+          if (searchErr) console.error('❌ [v1.7.2] people 完全一致検索エラー:', searchErr)
 
           if (!existingPerson) {
-            await supabase.from('people').insert({
+            const { error: pInsErr } = await supabase.from('people').insert({
               name: new_event_data.people_name,
               importance: 'B',
             })
+            if (pInsErr) console.error('❌ [v1.7.2] people INSERT エラー(conflict resolver):', pInsErr)
+            else console.log('✅ [v1.7.2] people INSERT 成功(conflict resolver):', new_event_data.people_name)
           }
         }
 
-        // pending を resolved に
-        await supabase
+        const { error: pcUpErr } = await supabase
           .from('pending_confirmation')
           .update({ status: 'resolved', confirmed_at: new Date().toISOString() })
           .eq('id', calendarConflict.id)
+        if (pcUpErr) console.error('❌ [v1.7.2] pending_confirmation UPDATE エラー:', pcUpErr)
 
         const replyTitle = new_event_data.title || '予定'
         const whoPart = new_event_data.people_name 
@@ -2050,8 +2175,7 @@ export async function POST(req: NextRequest) {
       }
 
       if (isDifferent) {
-        // 別件として新規INSERT
-        const { data: inserted } = await supabase
+        const { data: inserted, error: insErr } = await supabase
           .from('calendar')
           .insert({
             title: new_event_data.title,
@@ -2064,28 +2188,35 @@ export async function POST(req: NextRequest) {
           })
           .select('id')
           .single()
+        if (insErr) {
+          console.error('❌ [v1.7.2] calendar INSERT(別件)エラー:', insErr)
+        } else {
+          console.log('✅ [v1.7.2] calendar INSERT 成功(別件):', inserted?.id)
+        }
 
-        // people 処理
         if (new_event_data.people_name && inserted) {
-          const { data: existingPerson } = await supabase
+          const { data: existingPerson, error: searchErr } = await supabase
             .from('people')
             .select('id')
             .eq('name', new_event_data.people_name)
             .limit(1)
             .maybeSingle()
+          if (searchErr) console.error('❌ [v1.7.2] people 検索エラー:', searchErr)
 
           if (!existingPerson) {
-            await supabase.from('people').insert({
+            const { error: pInsErr } = await supabase.from('people').insert({
               name: new_event_data.people_name,
               importance: 'B',
             })
+            if (pInsErr) console.error('❌ [v1.7.2] people INSERT(別件)エラー:', pInsErr)
           }
         }
 
-        await supabase
+        const { error: pcUpErr } = await supabase
           .from('pending_confirmation')
           .update({ status: 'resolved', confirmed_at: new Date().toISOString() })
           .eq('id', calendarConflict.id)
+        if (pcUpErr) console.error('❌ [v1.7.2] pending UPDATE エラー(別件):', pcUpErr)
 
         const whoPart = new_event_data.people_name 
           ? `${new_event_data.people_name}との` 
@@ -2127,12 +2258,20 @@ export async function POST(req: NextRequest) {
   // ============================================================
   // v1.6.5: 受諾ワード → 能動応答(State 2 秘書哲学)
   // ============================================================
+  // ★v1.7.2: ACK検出の入口ログ(未発火原因特定用)
+  const ackTrimmed = lastUserMessage.trim()
+  console.log('🔎 [v1.7.2 ACK試行]', {
+    raw: rawUserMessage,
+    corrected: lastUserMessage,
+    trimmed: ackTrimmed,
+    char_codes: [...ackTrimmed].map(c => c.charCodeAt(0)),
+    length: ackTrimmed.length,
+  })
   const ackType = detectAcknowledgment(lastUserMessage)
   if (ackType) {
-    console.log('[v1.6.5 State2] 受諾ワード検出:', ackType, lastUserMessage.trim())
+    console.log('✅ [v1.7.2 ACK発火]', ackType, ackTrimmed)
 
-    // 残タスク検索
-    const { data: pendingTasks } = await supabase
+    const { data: pendingTasks, error: ptErr } = await supabase
       .from('task')
       .select('content, importance')
       .eq('done', false)
@@ -2142,10 +2281,10 @@ export async function POST(req: NextRequest) {
       .order('importance', { ascending: true })
       .order('created_at', { ascending: true })
       .limit(1)
+    if (ptErr) console.error('❌ [v1.7.2] ACK用task取得エラー:', ptErr)
 
-    // 今から先の予定
     const nowISO = new Date().toISOString()
-    const { data: upcomingEvents } = await supabase
+    const { data: upcomingEvents, error: ueErr } = await supabase
       .from('calendar')
       .select('title, datetime, is_tentative, missing_fields')
       .is('deleted_at', null)
@@ -2153,8 +2292,8 @@ export async function POST(req: NextRequest) {
       .gte('datetime', nowISO)
       .order('datetime', { ascending: true })
       .limit(1)
+    if (ueErr) console.error('❌ [v1.7.2] ACK用calendar取得エラー:', ueErr)
 
-    // 反応プレフィックス選択
     const prefixMap: Record<string, string[]> = {
       gratitude: ['どういたしまして。', 'お役に立てて何より。'],
       acknowledgment: [''],
@@ -2183,7 +2322,6 @@ export async function POST(req: NextRequest) {
       const tentativeLabel = ev.is_tentative ? '【仮】' : ''
       coreMsg = `${dateStr}に${tentativeLabel}「${ev.title}」があるよ。`
 
-      // 仮予定なら不足情報も促す
       if (ev.is_tentative && ev.missing_fields?.length) {
         const asks: string[] = []
         if (ev.missing_fields.includes('people')) asks.push('誰と')
@@ -2223,6 +2361,8 @@ export async function POST(req: NextRequest) {
         }),
       }],
     })
+  } else {
+    console.log('🔎 [v1.7.2 ACK不発火] — 通常フローへ')
   }
 
   const crisisType = detectCrisis(lastUserMessage)
@@ -2235,7 +2375,17 @@ export async function POST(req: NextRequest) {
   const memory = await fetchMemory(intent, keywords)
   const isHighRisk = HIGH_RISK_KEYWORDS.test(lastUserMessage)
 
-  const { data: userTalkRecord } = await supabase
+  // ★v1.7.2: 決定論的 intent 判定結果をログ
+  console.log('🎯 [v1.7.2 CLASSIFY]', {
+    router_intent: intent,
+    crisis: crisisType,
+    non_intervention: nonInterventionType,
+    topic_switched: topicSwitched,
+    after_empathy: afterEmpathy,
+    keywords,
+  })
+
+  const { data: userTalkRecord, error: utErr } = await supabase
     .from('talk_master')
     .insert({
       role: 'user',
@@ -2246,6 +2396,7 @@ export async function POST(req: NextRequest) {
     })
     .select('id')
     .single()
+  if (utErr) console.error('❌ [v1.7.2] talk_master(user) INSERT エラー:', utErr)
 
   const userMessageId = userTalkRecord?.id || `msg_${Date.now()}`
 
@@ -2294,6 +2445,15 @@ export async function POST(req: NextRequest) {
   const data = await res.json()
   const text = data.choices?.[0]?.message?.content ?? ''
 
+  // ★v1.7.2: LLM の生レスポンスを記録(震源特定用)
+  console.log('🔍 [v1.7.2 LLM RAW]', JSON.stringify({
+    text_length: text.length,
+    text_preview: text.substring(0, 800),
+    input: rawUserMessage,
+    corrected_input: lastUserMessage,
+    router_intent: intent,
+  }))
+
   let parsed: any = {
     reply: text,
     reason: '',
@@ -2307,7 +2467,22 @@ export async function POST(req: NextRequest) {
   try {
     const jsonStr = text.substring(text.indexOf('{'), text.lastIndexOf('}') + 1)
     parsed = JSON.parse(jsonStr)
-  } catch {}
+  } catch (e) {
+    console.error('❌ [v1.7.2] JSON parse失敗:', { error: String(e), text_preview: text.substring(0, 300) })
+  }
+
+  // ★v1.7.2: parsed の save 内容を記録
+  console.log('📦 [v1.7.2 PARSED]', JSON.stringify({
+    mode: parsed.mode,
+    reply_preview: (parsed.reply || '').substring(0, 100),
+    save_keys_present: parsed.save ? Object.keys(parsed.save) : [],
+    save_calendar: parsed.save?.calendar,
+    save_task: parsed.save?.task,
+    save_memo: parsed.save?.memo,
+    save_people: parsed.save?.people,
+    save_business: parsed.save?.business,
+    save_ideas: parsed.save?.ideas,
+  }))
 
   if (owner?.confidence < 0.4 && parsed.reply && !parsed.reply.startsWith('まだ学習中')) {
     parsed.reply = 'まだ学習中ですが、' + parsed.reply
@@ -2318,12 +2493,14 @@ export async function POST(req: NextRequest) {
   if (nonInterventionType && !crisisType) finalIntent = 'non_intervention'
   if (modifyAction && !crisisType && !nonInterventionType) finalIntent = 'modify'
 
+  // ★v1.7.2: save 実行(結果を受け取る)
+  let saveResults: SaveEntityResult[] = []
   if (finalIntent !== 'modify') {
-    await saveStructuredMemory(parsed.save, lastUserMessage, userMessageId)
+    saveResults = await saveStructuredMemory(parsed.save, lastUserMessage, userMessageId)
   }
   await saveDecision(lastUserMessage, finalIntent, parsed, owner)
 
-  await supabase.from('talk_master').insert({
+  const { error: noTalkErr } = await supabase.from('talk_master').insert({
     role: 'noida',
     content: parsed.reply || '',
     intent: finalIntent,
@@ -2331,6 +2508,18 @@ export async function POST(req: NextRequest) {
       finalIntent === 'empathy' || finalIntent === 'objection' ? 'A' : 'B',
     session_date: sessionDate,
   })
+  if (noTalkErr) console.error('❌ [v1.7.2] talk_master(noida) INSERT エラー:', noTalkErr)
+
+  // ★v1.7.2: リクエスト完了サマリ
+  const elapsedMs = Date.now() - requestStartTime
+  console.log('🏁 [v1.7.2 DONE]', JSON.stringify({
+    elapsed_ms: elapsedMs,
+    final_intent: finalIntent,
+    execution_status: executionResult.status,
+    save_results_count: saveResults.length,
+    save_successes: saveResults.filter(r => r.success).length,
+    save_failures: saveResults.filter(r => !r.success).length,
+  }))
 
   return NextResponse.json({
     content: [{
@@ -2343,6 +2532,8 @@ export async function POST(req: NextRequest) {
         mode: finalIntent,
         confidence_low: owner?.confidence < 0.4,
         saved: parsed.save || {},
+        // ★v1.7.2: save 実行結果をクライアントにも返す(開発デバッグ用)
+        save_result: saveResults,
         mutation:
           executionResult.status !== 'not_applicable'
             ? {
