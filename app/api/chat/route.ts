@@ -3258,6 +3258,156 @@ export async function POST(req: NextRequest) {
   }
 
   // ============================================================
+  // ★v2.0.4: Undo pre-routing(「戻して」「undo」等の短い発話)
+  // ============================================================
+  // 短い restore 発話は trash_queue から直近を自動復元
+  // 対象特定は /api/noida/undo endpoint に委譲
+  const isUndoShortPhrase = /^(戻して|元に戻して|undo|Undo|UNDO|やっぱ戻して|復元|やり直し)[!!。\.]*$/.test(lastUserMessage.trim())
+  if (isUndoShortPhrase) {
+    console.log('🔄 [v2.0.4] undo 短い発話を検出、直近復元を実行')
+    try {
+      // 直近の trash_queue レコードを自前で取る(内部関数呼び出し)
+      const { data: latestTrash, error: trashErr } = await supabase
+        .from('trash_queue')
+        .select('*')
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle()
+      
+      if (trashErr || !latestTrash) {
+        const reply = '直近に削除したものがないよ。'
+        await supabase.from('talk_master').insert({
+          role: 'user', content: rawUserMessage,
+          content_parsed: lastUserMessage !== rawUserMessage ? lastUserMessage : null,
+          intent: 'modify', importance: 'C', session_date: sessionDate,
+        })
+        await supabase.from('talk_master').insert({
+          role: 'noida', content: reply,
+          intent: 'modify', importance: 'C', session_date: sessionDate,
+        })
+        return NextResponse.json({
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              reply, options: [], mode: 'modify', save: {},
+              decision_log: { should_log: false },
+            }),
+          }],
+        })
+      }
+      
+      const { source_table, source_id, original_data } = latestTrash
+      let restoredTitle = ''
+      let restoreOk = false
+      
+      if (source_table === 'memo' || source_table === 'ideas') {
+        const { id, created_at, updated_at, ...rest } = original_data
+        const { error } = await supabase
+          .from(source_table)
+          .insert({ ...rest, id: source_id })
+        if (!error) {
+          restoredTitle = original_data?.content?.substring(0, 50) || '(復元)'
+          restoreOk = true
+        } else {
+          console.error(`❌ [v2.0.4 UNDO] ${source_table} INSERT エラー:`, error)
+        }
+      } else if (source_table === 'task' || source_table === 'calendar') {
+        const updates: any = {
+          deleted_at: null,
+          updated_at: new Date().toISOString(),
+        }
+        if (source_table === 'task') {
+          updates.state = 'active'
+          updates.done = false
+          updates.completed_at = null
+          updates.cancelled_at = null
+        } else {
+          updates.state = 'scheduled'
+          updates.cancelled_at = null
+        }
+        const { error } = await supabase
+          .from(source_table)
+          .update(updates)
+          .eq('id', source_id)
+        if (!error) {
+          restoredTitle = 
+            original_data?.title?.substring(0, 50) ||
+            original_data?.content?.substring(0, 50) ||
+            '(復元)'
+          restoreOk = true
+        } else {
+          console.error(`❌ [v2.0.4 UNDO] ${source_table} UPDATE エラー:`, error)
+        }
+      }
+      
+      if (restoreOk) {
+        // trash_queue から削除
+        await supabase.from('trash_queue').delete().eq('id', latestTrash.id)
+        // mutation_event_log
+        await supabase.from('mutation_event_log').insert({
+          user_message_id: userTalkIdOrFallback(null),
+          event_type: 'restore',
+          source_table,
+          source_id,
+          before_data: null,
+          after_data: original_data,
+          mutation_plan: { action: 'restore', source: 'chat_undo_pre_routing' },
+          resolver_strategy: 'user_confirmed',
+          confidence: 1.0,
+          executed_by: 'noida',
+          mutation_mode: 'confirmed',
+          idempotency_key: `undo_${latestTrash.id}_${Date.now()}`,
+        })
+        
+        const reply = `「${restoredTitle}」を戻した。`
+        await supabase.from('talk_master').insert({
+          role: 'user', content: rawUserMessage,
+          content_parsed: lastUserMessage !== rawUserMessage ? lastUserMessage : null,
+          intent: 'modify', importance: 'B', session_date: sessionDate,
+        })
+        await supabase.from('talk_master').insert({
+          role: 'noida', content: reply,
+          intent: 'modify', importance: 'B', session_date: sessionDate,
+        })
+        
+        console.log('✅ [v2.0.4 UNDO] 復元成功:', { source_table, source_id, restoredTitle })
+        
+        return NextResponse.json({
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              reply, options: [], mode: 'modify', save: {},
+              decision_log: { should_log: true, decision_text: reply },
+            }),
+          }],
+        })
+      } else {
+        const reply = '復元できなかった、もう一度試して。'
+        await supabase.from('talk_master').insert({
+          role: 'user', content: rawUserMessage,
+          content_parsed: lastUserMessage !== rawUserMessage ? lastUserMessage : null,
+          intent: 'modify', importance: 'B', session_date: sessionDate,
+        })
+        await supabase.from('talk_master').insert({
+          role: 'noida', content: reply,
+          intent: 'modify', importance: 'B', session_date: sessionDate,
+        })
+        return NextResponse.json({
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              reply, options: [], mode: 'modify', save: {},
+              decision_log: { should_log: false },
+            }),
+          }],
+        })
+      }
+    } catch (e: any) {
+      console.error('❌ [v2.0.4 UNDO] 例外:', e)
+    }
+  }
+
+  // ============================================================
   // 通常フロー
   // ============================================================
   const pendingFeedback = await fetchPendingFeedback()
