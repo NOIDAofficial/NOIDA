@@ -14,7 +14,7 @@ import {
 import { correctInput } from '@/lib/analyzer/inputCorrector'
 
 /**
- * NOIDA route.ts v1.7.2 (Phase 1 Day 7 - 観測可能性 + Silent Failure 撲滅)
+ * NOIDA route.ts v1.7.4 (Phase 1 Day 7 - 二層の正しさ原則の実装)
  *
  * ============================================================
  * v1.7.2 の追加内容(v1.7.1 からの差分)
@@ -77,6 +77,14 @@ import { correctInput } from '@/lib/analyzer/inputCorrector'
  *   - ACK 検出の入口ログ(文字コード付き)
  *   - classifyIntent の「案」境界修正
  *   - レスポンスに save_result 追加
+ * v1.7.3: JSON強制 + リトライ機構 + importance カラム削除
+ * v1.7.4: ★★★ 二層の正しさ(Dual Correctness)原則の実装 ★★★
+ *   - 原則11: オーナーの生の言葉(Layer A)を書き換えない
+ *   - 訂正版(Layer B)は NOIDA の内部理解用のみ
+ *   - talk_master に content_parsed カラム追加(Layer B の記録)
+ *   - 検索・保存・応答は Layer A 基準
+ *   - 意図分類のみ Layer B 使用
+ *   - inputCorrector.ts の厳格化と連動
  */
 
 const supabase = createClient(
@@ -1986,14 +1994,22 @@ decision_text には「何をすべきか」を動詞で終わる1文で。
 // ============================================================
 
 export async function POST(req: NextRequest) {
+  // ★v1.7.4: 二層の正しさ原則(Dual Correctness Principle)
+  //   rawUserMessage (Layer A): オーナーの生の言葉 — 絶対に書き換えない
+  //   lastUserMessage (Layer B): 訂正・補完版 — NOIDA の内部理解用
+  //
+  //   使用ルール:
+  //   - 検索・DB保存・応答テンプレート = Layer A を使う
+  //   - intent 分類・意図抽出・LLM へのコンテキスト = Layer B を使う
+  //   - 両者の差分は talk_master.content_parsed に記録する
   const requestStartTime = Date.now()
   const { messages } = await req.json()
   const rawUserMessage = messages[messages.length - 1]?.content || ''
   const sessionDate = getSessionDate()
 
-  // ★v1.7.2: リクエスト入口ログ
-  console.log('📥 [v1.7.2 REQUEST]', JSON.stringify({
-    raw_message: rawUserMessage,
+  // ★v1.7.4: リクエスト入口ログ(Layer A 記録)
+  console.log('📥 [v1.7.4 REQUEST]', JSON.stringify({
+    layerA_raw_message: rawUserMessage,  // ★ Layer A: 生の言葉
     raw_length: rawUserMessage.length,
     messages_count: messages.length,
     session_date: sessionDate,
@@ -2011,18 +2027,21 @@ export async function POST(req: NextRequest) {
     
     const correctionResult = await correctInput(rawUserMessage, precedingContext)
     
-    // ★v1.7.2: correctInput の結果を常にログ
+    // ★v1.7.4: correctInput の結果を Layer A/B の観点でログ
+    //   Layer A = 生の言葉(オーナーの意図)
+    //   Layer B = 訂正版(NOIDA の理解)
     if (correctionResult.was_corrected) {
-      console.log('✏️ [v1.7.2 INPUT訂正]', {
-        original: correctionResult.original,
-        corrected: correctionResult.corrected,
+      console.log('✏️ [v1.7.4 二層の正しさ]', {
+        layerA_original: correctionResult.original,        // ★ Layer A
+        layerB_corrected: correctionResult.corrected,      // ★ Layer B
         corrections: correctionResult.corrections,
+        validation_failed: correctionResult.validation_failed || false,
       })
-      lastUserMessage = correctionResult.corrected
+      lastUserMessage = correctionResult.corrected  // Layer B として使う
     } else {
-      console.log('✏️ [v1.7.2 INPUT訂正]', {
-        original: rawUserMessage,
-        corrected: '(未訂正)',
+      console.log('✏️ [v1.7.4 二層の正しさ]', {
+        layerA_original: rawUserMessage,
+        layerB_corrected: '(差分なし・Layer A のまま)',
       })
     }
   } catch (e) {
@@ -2145,9 +2164,11 @@ export async function POST(req: NextRequest) {
           : ''
         const reply = `${whoPart}${replyTitle}として確定した。`
 
+        // ★v1.7.4: Layer A (rawUserMessage) を content に、Layer B (lastUserMessage) を content_parsed に
         await supabase.from('talk_master').insert({
           role: 'user',
-          content: lastUserMessage,
+          content: rawUserMessage,  // ★ Layer A(生)
+          content_parsed: lastUserMessage !== rawUserMessage ? lastUserMessage : null,  // ★ Layer B(訂正版)
           intent: 'modify',
           importance: 'B',
           session_date: sessionDate,
@@ -2224,9 +2245,11 @@ export async function POST(req: NextRequest) {
         const tentativeLabel = new_event_data.is_tentative ? '【仮】' : ''
         const reply = `別件として${tentativeLabel}${whoPart}${new_event_data.title}を追加した。`
 
+        // ★v1.7.4: Layer A (rawUserMessage) を content に、Layer B (lastUserMessage) を content_parsed に
         await supabase.from('talk_master').insert({
           role: 'user',
-          content: lastUserMessage,
+          content: rawUserMessage,  // ★ Layer A(生)
+          content_parsed: lastUserMessage !== rawUserMessage ? lastUserMessage : null,  // ★ Layer B(訂正版)
           intent: 'execute',
           importance: 'B',
           session_date: sessionDate,
@@ -2271,17 +2294,17 @@ export async function POST(req: NextRequest) {
   if (ackType) {
     console.log('✅ [v1.7.2 ACK発火]', ackType, ackTrimmed)
 
+    // ★v1.7.3: task.importance カラムは存在しないので削除
     const { data: pendingTasks, error: ptErr } = await supabase
       .from('task')
-      .select('content, importance')
+      .select('content')
       .eq('done', false)
       .is('deleted_at', null)
       .neq('state', 'completed')
       .neq('state', 'cancelled')
-      .order('importance', { ascending: true })
       .order('created_at', { ascending: true })
       .limit(1)
-    if (ptErr) console.error('❌ [v1.7.2] ACK用task取得エラー:', ptErr)
+    if (ptErr) console.error('❌ [v1.7.3] ACK用task取得エラー:', ptErr)
 
     const nowISO = new Date().toISOString()
     const { data: upcomingEvents, error: ueErr } = await supabase
@@ -2334,9 +2357,11 @@ export async function POST(req: NextRequest) {
 
     const reply = prefix + coreMsg
 
+    // ★v1.7.4: Layer A (rawUserMessage) を content に、Layer B (lastUserMessage) を content_parsed に
     await supabase.from('talk_master').insert({
       role: 'user',
-      content: lastUserMessage,
+      content: rawUserMessage,  // ★ Layer A(生)
+      content_parsed: lastUserMessage !== rawUserMessage ? lastUserMessage : null,  // ★ Layer B(訂正版)
       intent: 'empathy',
       importance: 'C',
       session_date: sessionDate,
@@ -2385,18 +2410,23 @@ export async function POST(req: NextRequest) {
     keywords,
   })
 
+  // ★v1.7.4: Layer A (rawUserMessage) を content に、Layer B (lastUserMessage) を content_parsed に
+  //   二層の正しさ原則:
+  //   - content = オーナーの生の言葉(検索・保存・応答の基準)
+  //   - content_parsed = 訂正・補完版(NOIDAの理解の記録、分析用)
   const { data: userTalkRecord, error: utErr } = await supabase
     .from('talk_master')
     .insert({
       role: 'user',
-      content: lastUserMessage,
+      content: rawUserMessage,  // ★ Layer A(生)
+      content_parsed: lastUserMessage !== rawUserMessage ? lastUserMessage : null,  // ★ Layer B(訂正版・差分がある場合のみ)
       intent: intent,
       importance: intent === 'objection' ? 'A' : 'B',
       session_date: sessionDate,
     })
     .select('id')
     .single()
-  if (utErr) console.error('❌ [v1.7.2] talk_master(user) INSERT エラー:', utErr)
+  if (utErr) console.error('❌ [v1.7.4] talk_master(user) INSERT エラー:', utErr)
 
   const userMessageId = userTalkRecord?.id || `msg_${Date.now()}`
 
@@ -2428,6 +2458,8 @@ export async function POST(req: NextRequest) {
     }))
     .slice(-10)
 
+  // ★v1.7.3: response_format で JSON 強制(地の文返し対策)
+  //   gpt-4o-mini は json_object モード対応。これにより LLM が必ず valid JSON を返す
   const res = await fetch('https://api.openai.com/v1/chat/completions', {
     method: 'POST',
     headers: {
@@ -2438,6 +2470,7 @@ export async function POST(req: NextRequest) {
       model: 'gpt-4o-mini',
       temperature: 0.2,
       max_tokens: 1000,
+      response_format: { type: 'json_object' },
       messages: [{ role: 'system', content: systemPrompt }, ...cleanMessages],
     }),
   })
@@ -2468,7 +2501,51 @@ export async function POST(req: NextRequest) {
     const jsonStr = text.substring(text.indexOf('{'), text.lastIndexOf('}') + 1)
     parsed = JSON.parse(jsonStr)
   } catch (e) {
-    console.error('❌ [v1.7.2] JSON parse失敗:', { error: String(e), text_preview: text.substring(0, 300) })
+    console.error('❌ [v1.7.3] JSON parse失敗(1回目):', { error: String(e), text_preview: text.substring(0, 300) })
+
+    // ★v1.7.3: JSON parse失敗時に1回だけリトライ(「JSON形式で出せ」を強調)
+    console.log('🔄 [v1.7.3] LLM応答が不正なJSONのため、リトライ実行')
+    try {
+      const retryRes = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+        },
+        body: JSON.stringify({
+          model: 'gpt-4o-mini',
+          temperature: 0.1,
+          max_tokens: 1000,
+          response_format: { type: 'json_object' },
+          messages: [
+            { role: 'system', content: systemPrompt },
+            ...cleanMessages,
+            { role: 'assistant', content: text },
+            {
+              role: 'user',
+              content: '上記の応答をJSON形式(reply/mode/save/decision_log を含む)で再出力してください。JSON以外の文字は一切不要です。',
+            },
+          ],
+        }),
+      })
+      const retryData = await retryRes.json()
+      const retryText = retryData.choices?.[0]?.message?.content ?? ''
+      console.log('🔄 [v1.7.3] リトライ応答:', retryText.substring(0, 300))
+
+      const retryJsonStr = retryText.substring(retryText.indexOf('{'), retryText.lastIndexOf('}') + 1)
+      parsed = JSON.parse(retryJsonStr)
+      console.log('✅ [v1.7.3] リトライ成功')
+    } catch (retryErr) {
+      console.error('❌ [v1.7.3] JSON parse失敗(リトライも失敗):', retryErr)
+      // フォールバック: 地の文を reply として採用、save は空
+      parsed = {
+        reply: text,
+        mode: intent,
+        save: {},
+        options: [],
+        decision_log: { should_log: false },
+      }
+    }
   }
 
   // ★v1.7.2: parsed の save 内容を記録
@@ -2510,15 +2587,19 @@ export async function POST(req: NextRequest) {
   })
   if (noTalkErr) console.error('❌ [v1.7.2] talk_master(noida) INSERT エラー:', noTalkErr)
 
-  // ★v1.7.2: リクエスト完了サマリ
+  // ★v1.7.4: リクエスト完了サマリ(二層の正しさの遵守状況も記録)
   const elapsedMs = Date.now() - requestStartTime
-  console.log('🏁 [v1.7.2 DONE]', JSON.stringify({
+  const wasCorrected = lastUserMessage !== rawUserMessage
+  console.log('🏁 [v1.7.4 DONE]', JSON.stringify({
     elapsed_ms: elapsedMs,
     final_intent: finalIntent,
     execution_status: executionResult.status,
     save_results_count: saveResults.length,
     save_successes: saveResults.filter(r => r.success).length,
     save_failures: saveResults.filter(r => !r.success).length,
+    // ★v1.7.4: 二層の正しさの記録
+    layer_a_preserved: true,               // 常にtrue(設計上)
+    layer_b_used_for_understanding: wasCorrected,  // 訂正があったら Layer B を意図理解に使った
   }))
 
   return NextResponse.json({
