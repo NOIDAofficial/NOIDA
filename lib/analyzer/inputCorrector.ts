@@ -589,4 +589,4 @@ export function debugCorrection(result: CorrectionResult): string {
     lines.push(`  ❌ バリデーション失敗(訂正を却下)`)
   }
   return lines.join('\n')
-}s
+}
