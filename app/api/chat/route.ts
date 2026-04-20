@@ -3267,10 +3267,12 @@ export async function POST(req: NextRequest) {
     console.log('🔄 [v2.0.4] undo 短い発話を検出、直近復元を実行')
     try {
       // 直近の trash_queue レコードを自前で取る(内部関数呼び出し)
+      // ★v2.0.5: 実カラム名 deleted_at で並べ、restored=false のみ取得
       const { data: latestTrash, error: trashErr } = await supabase
         .from('trash_queue')
         .select('*')
-        .order('created_at', { ascending: false })
+        .eq('restored', false)
+        .order('deleted_at', { ascending: false })
         .limit(1)
         .maybeSingle()
       
@@ -3341,8 +3343,11 @@ export async function POST(req: NextRequest) {
       }
       
       if (restoreOk) {
-        // trash_queue から削除
-        await supabase.from('trash_queue').delete().eq('id', latestTrash.id)
+        // ★v2.0.5: trash_queue は物理削除じゃなく restored=true で履歴保持
+        await supabase
+          .from('trash_queue')
+          .update({ restored: true, restored_at: new Date().toISOString() })
+          .eq('id', latestTrash.id)
         // mutation_event_log
         await supabase.from('mutation_event_log').insert({
           user_message_id: userTalkIdOrFallback(null),
