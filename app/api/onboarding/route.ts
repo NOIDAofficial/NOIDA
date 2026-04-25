@@ -4,6 +4,11 @@
  * 11問のオンボーディング回答を受け取り、
  * GPT-4o で 50軸推定 → 768プリセット → owner_master 生成
  * 
+ * ✨ v2 改良点:
+ * - 4 軸分類(preset_id / risk_stance / time_horizon / value_driver)を保存
+ * - 初期人格 prompt を buildPersonaPrompt() で生成し initial_persona_prompt に永久保存
+ * - UPDATE 時は initial_persona_prompt を保護(永久不可変の原則)
+ * 
  * 配置先: app/api/onboarding/route.ts
  */
 
@@ -11,6 +16,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { createClient } from '@supabase/supabase-js'
 import OpenAI from 'openai'
 import { MBTI_OPTIONS, isValidMBTI } from '@/lib/mbti'
+import { buildPersonaPrompt } from '@/lib/persona'
 
 const SUPABASE_KEY =
   process.env.SUPABASE_SERVICE_ROLE_KEY ||
@@ -77,7 +83,7 @@ export async function POST(req: NextRequest) {
     const validMBTI = body.mbti && isValidMBTI(body.mbti) ? body.mbti : null
     
     // ===========================
-    // Step 1: GPT-4o で 50軸推定 + プリセット生成
+    // Step 1: GPT-4o で 4軸分類 + 人格推定
     // ===========================
     
     const mbtiHint = validMBTI 
@@ -115,7 +121,8 @@ export async function POST(req: NextRequest) {
 # 重要
 - JSON のみ出力、前置き・後置き禁止
 - confidence は MBTI 自己申告あり=0.65、なし=0.55
-- summary_for_user はユーザーの心に響く短い言葉で`
+- summary_for_user はユーザーの心に響く短い言葉で
+- preset_id / risk_stance / time_horizon / value_driver は必ず上記の指定値から選ぶ(自由生成禁止)`
 
     const userPrompt = `オーナー名: ${body.name}
 ${body.company ? `会社: ${body.company}\n` : ''}${body.position ? `役職: ${body.position}\n` : ''}
@@ -188,13 +195,41 @@ ${mbtiHint}`
     }
     
     // ===========================
-    // Step 2: owner_master に INSERT or UPDATE
+    // Step 2: 初期人格 prompt の生成(12,288通りの組み立て)
+    // ===========================
+    const finalMBTI = validMBTI || analysis.mbti_estimated || null
+
+    const initialPersonaPrompt = buildPersonaPrompt({
+      preset_id: analysis.preset_id,
+      risk_stance: analysis.risk_stance,
+      time_horizon: analysis.time_horizon,
+      value_driver: analysis.value_driver,
+      mbti: finalMBTI,
+    })
+
+    console.log('🧬 [ONBOARDING] 初期人格生成:', {
+      preset_id: analysis.preset_id,
+      risk_stance: analysis.risk_stance,
+      time_horizon: analysis.time_horizon,
+      value_driver: analysis.value_driver,
+      mbti: finalMBTI,
+      promptLength: initialPersonaPrompt.length,
+    })
+
+    // ===========================
+    // Step 3: owner_master に INSERT or UPDATE
     // ===========================
     
     const ownerData: Record<string, any> = {
       name: body.name,
       company: body.company || null,
       position: body.position || null,
+
+      // 4 軸分類(Persona System 用)
+      preset_id: analysis.preset_id,
+      risk_stance: analysis.risk_stance,
+      time_horizon: analysis.time_horizon,
+      value_driver: analysis.value_driver,
       
       // 人格情報
       thinking_pattern: analysis.thinking_pattern,
@@ -213,9 +248,13 @@ ${mbtiHint}`
       context_tags: analysis.context_tags || [],
       
       // MBTI
-      mbti: validMBTI || analysis.mbti_estimated || null,
+      mbti: finalMBTI,
       mbti_confidence: validMBTI ? 0.65 : (analysis.mbti_estimated ? 0.4 : 0),
       mbti_source: validMBTI ? 'self_reported' : (analysis.mbti_estimated ? 'estimated' : null),
+
+      // ✨ 初期人格 prompt(永久不可変)
+      initial_persona_prompt: initialPersonaPrompt,
+      persona_version: 0,  // 育成バッチで +1 されていく
       
       // confidence
       confidence: analysis.confidence || 0.55,
@@ -246,15 +285,16 @@ ${mbtiHint}`
     let ownerId: string
     
     if (existing) {
-      // UPDATE(既存)
+      // UPDATE(既存):initial_persona_prompt と persona_version は永久固定なので除外
+      const { initial_persona_prompt, persona_version, ...updateData } = ownerData
       const { error: updateErr } = await supabase
         .from('owner_master')
-        .update(ownerData)
+        .update(updateData)
         .eq('id', existing.id)
       
       if (updateErr) throw new Error(`owner_master UPDATE 失敗: ${updateErr.message}`)
       ownerId = existing.id
-      console.log('🔄 [ONBOARDING] owner_master 更新:', ownerId)
+      console.log('🔄 [ONBOARDING] owner_master 更新(initial_persona は保護):', ownerId)
     } else {
       // INSERT(新規)
       const { data: inserted, error: insertErr } = await supabase
@@ -265,11 +305,11 @@ ${mbtiHint}`
       
       if (insertErr) throw new Error(`owner_master INSERT 失敗: ${insertErr.message}`)
       ownerId = inserted.id
-      console.log('✨ [ONBOARDING] owner_master 新規作成:', ownerId)
+      console.log('✨ [ONBOARDING] owner_master 新規作成(initial_persona 保存済):', ownerId)
     }
     
     // ===========================
-    // Step 3: milestone_log に誕生日記録
+    // Step 4: milestone_log に誕生日記録
     // ===========================
     
     await supabase.from('milestone_log').insert({
@@ -297,14 +337,14 @@ ${mbtiHint}`
           risk_stance: analysis.risk_stance,
           time_horizon: analysis.time_horizon,
           value_driver: analysis.value_driver,
-          mbti_final: validMBTI || analysis.mbti_estimated,
+          mbti_final: finalMBTI,
           confidence: analysis.confidence,
         },
       },
     })
     
     // ===========================
-    // Step 4: current_focus を task に初期タスクとして登録
+    // Step 5: current_focus を task に初期タスクとして登録
     // ===========================
     
     if (body.q10_current_theme?.trim()) {
@@ -333,7 +373,7 @@ ${mbtiHint}`
         preset_id: analysis.preset_id,
         risk_stance: analysis.risk_stance,
         value_driver: analysis.value_driver,
-        mbti: validMBTI || analysis.mbti_estimated,
+        mbti: finalMBTI,
         confidence: analysis.confidence,
         summary: analysis.summary_for_user,
       },

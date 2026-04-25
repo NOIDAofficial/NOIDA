@@ -1,764 +1,744 @@
-'use client'
+import React,{useEffect,useRef,useState}from'react'
+import{
+  View,Text,StyleSheet,TouchableOpacity,TextInput,
+  Animated,Easing,
+  ScrollView,Dimensions,Keyboard,
+}from'react-native'
+import{useSafeAreaInsets}from'react-native-safe-area-context'
+import{KeyboardStickyView}from'react-native-keyboard-controller'
+import*as Haptics from'expo-haptics'
+import{useOnboarding,AnalysisResult}from'../hooks/useOnboarding'
+import{MBTI_OPTIONS,MBTI_UNKNOWN_HEX}from'../lib/mbti'
+import type{MBTICode}from'../lib/mbti'
+import type{SelectQuestion,TextQuestion}from'../lib/onboarding'
+import type{OnboardingPhase}from'../App'
 
-import { useState, useEffect } from 'react'
-import { MBTI_OPTIONS, MBTIOption } from '@/lib/mbti'
+const{width:SW}=Dimensions.get('window')
+const ORB_AREA_HEIGHT=260
 
-/**
- * NOIDA オンボーディング(Web版・Phase 2-A-1)
- * 
- * 構成:
- *   intro → profile → q1-q10 → q11(MBTI) → analyzing → complete
- * 
- * 演出(簡易・Web版):
- *   - 画面上部に小さな「核」(CSS gradient)
- *   - 質問進捗に応じて光量増加
- *   - Q11 MBTI 選択で核の色が MBTI カラーに変化 + パルス
- *   - Q10 完了後、暗転 → マジックモーメント
- * 
- * アプリ版で本格演出(NOIDAOrb.tsx の WebGL)に置き換え予定
- */
-
-// ============================================
-// 質問定義(10問 + Q11)
-// ============================================
-
-interface QuestionSelect {
-  id: string
-  type: 'select'
-  label: string
-  question: string
-  options: { value: string; label: string }[]
+interface Props{
+  onPulseMBTI:(color:[number,number,number])=>void
+  onComplete:(result:AnalysisResult)=>void
+  onSelectedMBTIChange:(code:MBTICode|'unknown'|null)=>void
+  onPhaseChange:(phase:OnboardingPhase,subProgress:number)=>void
+  onTypingFocus:(focused:boolean)=>void
 }
 
-interface QuestionText {
-  id: string
-  type: 'text'
-  label: string
-  question: string
-  placeholder: string
-  minLength: number
-  rows?: number
-}
+export default function OnboardingScreen({onPulseMBTI,onComplete,onSelectedMBTIChange,onPhaseChange,onTypingFocus}:Props){
+  const insets=useSafeAreaInsets()
+  const o=useOnboarding()
+  const[birthProgress,setBirthProgress]=useState(0)
+  const[inBirth,setInBirth]=useState(false)
 
-type Question = QuestionSelect | QuestionText
-
-const QUESTIONS: Question[] = [
-  {
-    id: 'q1_avoid',
-    type: 'select',
-    label: 'Q1 / 10',
-    question: 'あなたが最も避けたいのは?',
-    options: [
-      { value: 'money_loss',    label: 'お金や機会を失うこと' },
-      { value: 'time_waste',    label: '時間を無駄にすること' },
-      { value: 'losing',        label: '人に負けること' },
-      { value: 'inauthentic',   label: '自分らしくない選択をすること' },
-      { value: 'looking_bad',   label: '周囲からダサく見られること' },
-    ],
-  },
-  {
-    id: 'q2_judge_angle',
-    type: 'select',
-    label: 'Q2 / 10',
-    question: '新しい案を見た時、最初に気にするのは?',
-    options: [
-      { value: 'profit',      label: '儲かるか' },
-      { value: 'interesting', label: '面白いか' },
-      { value: 'sustainable', label: '続くか' },
-      { value: 'fast',        label: '速く進められるか' },
-      { value: 'advantage',   label: '競争優位があるか' },
-    ],
-  },
-  {
-    id: 'q3_info_shortage',
-    type: 'select',
-    label: 'Q3 / 10',
-    question: '情報が足りない時は?',
-    options: [
-      { value: 'research',  label: '追加で調べる' },
-      { value: 'test',      label: '小さく試す' },
-      { value: 'intuition', label: '直感で決める' },
-      { value: 'ask',       label: '誰かに聞く' },
-      { value: 'pause',     label: '一旦止める' },
-    ],
-  },
-  {
-    id: 'q4_ideal_advice',
-    type: 'select',
-    label: 'Q4 / 10',
-    question: '理想のアドバイスは?',
-    options: [
-      { value: 'conclusion',       label: '結論だけ' },
-      { value: 'reason',           label: '結論と理由' },
-      { value: 'comparison',       label: '選択肢比較' },
-      { value: 'harsh',            label: '厳しく本音' },
-      { value: 'gentle',           label: '優しく伴走' },
-    ],
-  },
-  {
-    id: 'q5_approach',
-    type: 'select',
-    label: 'Q5 / 10',
-    question: 'あなたに近いのは?',
-    options: [
-      { value: 'act',      label: 'まず動く' },
-      { value: 'think',    label: 'まず考える' },
-      { value: 'organize', label: 'まず整理する' },
-      { value: 'consult',  label: 'まず相談する' },
-      { value: 'feel',     label: 'まず熱が乗るか見る' },
-    ],
-  },
-  {
-    id: 'q6_resource',
-    type: 'select',
-    label: 'Q6 / 10',
-    question: '今月中に結果が欲しいが、長期で育つ案もある。資金は少ない。どうする?',
-    options: [
-      { value: 'short_first',  label: '今月の結果を優先、長期案は後回し' },
-      { value: 'long_only',    label: '長期案に全振り、短期は諦める' },
-      { value: 'balance_82',   label: '8割短期・2割長期で両方動かす' },
-      { value: 'hold_all',     label: '資金が足りない時点で両方保留' },
-      { value: 'wait_info',    label: 'もう少し情報が揃うまで待つ' },
-    ],
-  },
-  {
-    id: 'q7_market_vs_aesthetic',
-    type: 'select',
-    label: 'Q7 / 10',
-    question: '自分は好きだが、市場は微妙そうな企画。どうする?',
-    options: [
-      { value: 'push',         label: '押す(自分の美意識が最優先)' },
-      { value: 'stop',         label: 'やめる(市場が全て)' },
-      { value: 'small_test',   label: '条件付きでやる(小さくテスト)' },
-      { value: 'ask_trusted',  label: '信頼できる人に意見を聞いてから決める' },
-      { value: 'sleep_on_it',  label: '一旦寝かせる' },
-    ],
-  },
-  {
-    id: 'q8_recovery',
-    type: 'select',
-    label: 'Q8 / 10',
-    question: '大きなミスをした直後、まず取る行動に一番近いのは?',
-    options: [
-      { value: 'distance',    label: '一旦距離を置いて頭を冷やす' },
-      { value: 'talk',        label: '誰かに話して整理する' },
-      { value: 'analyze',     label: 'すぐ原因を分解して次の対策を決める' },
-      { value: 'small_win',   label: '別の小さな成功を作って流れを変える' },
-      { value: 'next_day',    label: 'その日は深追いせず翌日に持ち越す' },
-    ],
-  },
-  {
-    id: 'q9_core_values',
-    type: 'text',
-    label: 'Q9 / 10',
-    question: '今、一番大事にしていることは何ですか?',
-    placeholder: '仕事でも人生でも、どちらでも構いません。',
-    minLength: 5,
-    rows: 3,
-  },
-  {
-    id: 'q10_current_theme',
-    type: 'text',
-    label: 'Q10 / 10',
-    question: '今、あなたが一番頭を使っているテーマは何ですか?',
-    placeholder: 'うまくいっていない理由、または迷っている理由もあれば教えてください。',
-    minLength: 5,
-    rows: 4,
-  },
-]
-
-// ============================================
-// メインコンポーネント
-// ============================================
-
-type Step = 'intro' | 'profile' | 'questions' | 'mbti' | 'analyzing' | 'complete' | 'error'
-
-export default function OnboardingPage() {
-  const [step, setStep] = useState<Step>('intro')
-  const [profile, setProfile] = useState({ name: '', company: '', position: '' })
-  const [currentQ, setCurrentQ] = useState(0)
-  const [answers, setAnswers] = useState<Record<string, string>>({})
-  const [mbti, setMbti] = useState<string | 'unknown' | null>(null)
-  const [mbtiPulseKey, setMbtiPulseKey] = useState(0)  // パルス発火用
-  const [analysisResult, setAnalysisResult] = useState<any>(null)
-  const [errorMsg, setErrorMsg] = useState('')
-  
-  // 現在の核の光量レベル(0.0 〜 1.0)
-  const getOrbLevel = (): number => {
-    if (step === 'intro' || step === 'profile') return 0.1
-    if (step === 'questions') return 0.15 + (currentQ / 10) * 0.65
-    if (step === 'mbti') return 0.85
-    if (step === 'analyzing') return 1.0
-    if (step === 'complete') return 1.0
-    return 0.1
-  }
-  
-  // 現在の核の色
-  const getOrbColor = (): [number, number, number] => {
-    if ((step === 'mbti' || step === 'complete') && mbti && mbti !== 'unknown') {
-      const opt = MBTI_OPTIONS.find(o => o.code === mbti)
-      if (opt) return opt.color as [number, number, number]
+  useEffect(()=>{
+    if(inBirth){
+      onPhaseChange('birth',birthProgress)
+      return
     }
-    return [0.38, 0.62, 1.0]  // デフォルト NOIDA 青
-  }
-  
-  const handleSelectAnswer = (questionId: string, value: string) => {
-    setAnswers(prev => ({ ...prev, [questionId]: value }))
-  }
-  
-  const handleTextAnswer = (questionId: string, value: string) => {
-    setAnswers(prev => ({ ...prev, [questionId]: value }))
-  }
-  
-  const handleNextQuestion = () => {
-    if (currentQ < QUESTIONS.length - 1) {
-      setCurrentQ(prev => prev + 1)
-    } else {
-      setStep('mbti')
+    if(o.state.step==='welcome')onPhaseChange('welcome',0)
+    else if(o.state.step==='profile')onPhaseChange('profile',0)
+    else if(o.state.step==='questions'){
+      const p=o.state.currentQ/9
+      onPhaseChange('questions',p)
     }
-  }
-  
-  const handleMBTISelect = (selection: string | 'unknown') => {
-    setMbti(selection)
-    setMbtiPulseKey(prev => prev + 1)  // パルス再発火
-  }
-  
-  const handleStartAnalysis = async () => {
-    setStep('analyzing')
-    
-    try {
-      const payload = {
-        name: profile.name,
-        company: profile.company || undefined,
-        position: profile.position || undefined,
-        ...answers,
-        mbti: mbti === 'unknown' ? null : mbti,
+    else if(o.state.step==='mbti')onPhaseChange('mbti',1)
+    else if(o.state.step==='analyzing')onPhaseChange('analyzing',1)
+    else if(o.state.step==='complete')onPhaseChange('complete',1)
+  },[o.state.step,o.state.currentQ,inBirth,birthProgress])
+
+  const goToQuestionsWithBirth=()=>{
+    setInBirth(true)
+    setBirthProgress(0)
+    const start=Date.now()
+    const DUR=2400
+    const tick=()=>{
+      const e=Date.now()-start
+      if(e>=DUR){
+        setBirthProgress(1)
+        setInBirth(false)
+        o.goToStep('questions')
+        return
       }
-      
-      const res = await fetch('/api/onboarding', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      })
-      
-      const data = await res.json()
-      
-      if (!data.success) {
-        throw new Error(data.message || 'オンボーディング失敗')
-      }
-      
-      setAnalysisResult(data)
-      
-      // 演出のため 2 秒待つ(マジックモーメント)
-      setTimeout(() => {
-        setStep('complete')
-      }, 2000)
-    } catch (e: any) {
-      console.error(e)
-      setErrorMsg(e.message || 'エラーが発生しました')
-      setStep('error')
+      const raw=e/DUR
+      const eased=1-Math.pow(1-raw,2)
+      setBirthProgress(eased)
+      requestAnimationFrame(tick)
     }
+    requestAnimationFrame(tick)
   }
-  
-  // ===========================
-  // 画面描画
-  // ===========================
-  
-  return (
-    <div className="min-h-screen bg-[#0e0e16] text-white relative overflow-hidden">
-      {/* 画面上部の「核」(CSS 簡易版) */}
-      <NoidaOrb 
-        level={getOrbLevel()} 
-        color={getOrbColor()} 
-        pulseKey={mbtiPulseKey}
-      />
-      
-      {/* コンテンツ */}
-      <div className="relative z-10 min-h-screen flex items-center justify-center p-6 pt-40">
-        <div className="max-w-md w-full">
-          {step === 'intro' && <IntroScreen onNext={() => setStep('profile')} />}
-          {step === 'profile' && (
-            <ProfileScreen 
-              profile={profile} 
-              setProfile={setProfile} 
-              onNext={() => setStep('questions')} 
-            />
-          )}
-          {step === 'questions' && (
-            <QuestionScreen
-              question={QUESTIONS[currentQ]}
-              answer={answers[QUESTIONS[currentQ].id]}
-              onSelectAnswer={v => handleSelectAnswer(QUESTIONS[currentQ].id, v)}
-              onTextAnswer={v => handleTextAnswer(QUESTIONS[currentQ].id, v)}
-              onNext={handleNextQuestion}
-              progress={(currentQ + 1) / QUESTIONS.length}
-            />
-          )}
-          {step === 'mbti' && (
-            <MBTIScreen
-              selected={mbti}
-              onSelect={handleMBTISelect}
-              onStart={handleStartAnalysis}
-            />
-          )}
-          {step === 'analyzing' && <AnalyzingScreen name={profile.name} />}
-          {step === 'complete' && (
-            <CompleteScreen 
-              name={profile.name} 
-              result={analysisResult}
-              mbti={mbti !== 'unknown' ? mbti : null}
-            />
-          )}
-          {step === 'error' && <ErrorScreen message={errorMsg} />}
-        </div>
-      </div>
-    </div>
+
+  if(!o.isHydrated){
+    return(
+      <View style={{flex:1,justifyContent:'center',alignItems:'center'}}>
+        <Text style={{color:'rgba(255,255,255,0.2)',fontSize:12,letterSpacing:4}}>…</Text>
+      </View>
+    )
+  }
+
+  if(inBirth){
+    return<View style={{flex:1}}/>
+  }
+
+  if(o.state.step==='analyzing'){
+    return<AnalyzingView insetTop={insets.top}/>
+  }
+  if(o.state.step==='complete'&&o.result){
+    return<CompleteView insetTop={insets.top} insetBottom={insets.bottom} result={o.result} onStart={()=>onComplete(o.result!)}/>
+  }
+
+  if(o.state.step==='welcome'){
+    return(
+      <View style={{flex:1,paddingTop:insets.top}}>
+        <WelcomeView onStart={()=>o.goToStep('profile')} insetBottom={insets.bottom}/>
+      </View>
+    )
+  }
+
+  if(o.state.step==='profile'){
+    return(
+      <View style={{flex:1,paddingTop:insets.top}}>
+        <ProfileView
+          name={o.state.answers.name}
+          company={o.state.answers.company}
+          position={o.state.answers.position}
+          onChange={o.setProfile}
+          onBack={()=>o.goToStep('welcome')}
+          onNext={goToQuestionsWithBirth}
+          insetBottom={insets.bottom}
+          onTypingFocus={onTypingFocus}
+        />
+      </View>
+    )
+  }
+
+  return(
+    <View style={{flex:1}}>
+      <View style={{height:insets.top+ORB_AREA_HEIGHT}}/>
+      <View style={{flex:1}}>
+        {o.state.step==='questions'&&o.currentQuestion&&(
+          <QuestionView
+            q={o.currentQuestion}
+            value={(o.state.answers as any)[o.currentQuestion.id]||''}
+            progress={o.progressPercent}
+            onAnswer={(v)=>{
+              o.answerQuestion(o.currentQuestion!.id,v)
+              if(o.currentQuestion!.type==='select'){
+                setTimeout(()=>o.nextQuestion(),220)
+              }
+            }}
+            onNext={()=>{Keyboard.dismiss();o.nextQuestion()}}
+            onBack={()=>{Keyboard.dismiss();o.prevQuestion()}}
+            insetBottom={insets.bottom}
+            onTypingFocus={onTypingFocus}
+          />
+        )}
+        {o.state.step==='mbti'&&(
+          <MBTIView
+            selected={o.state.answers.mbti??null}
+            onSelect={(code)=>{
+              o.setMBTI(code)
+              onSelectedMBTIChange(code)
+              if(code==='unknown'){
+                onPulseMBTI([0.9,0.9,1.0])
+              }else if(code){
+                const opt=MBTI_OPTIONS.find(m=>m.code===code)
+                if(opt)onPulseMBTI(opt.color as [number,number,number])
+              }
+            }}
+            onBack={()=>o.goToStep('questions')}
+            onSubmit={o.submit}
+            error={o.error}
+            isSubmitting={o.isSubmitting}
+            insetBottom={insets.bottom}
+          />
+        )}
+      </View>
+    </View>
   )
 }
 
-// ============================================
-// 核コンポーネント(CSS 簡易版)
-// ============================================
+function WelcomeView({onStart,insetBottom}:{onStart:()=>void;insetBottom:number}){
+  const f1=useRef(new Animated.Value(0)).current
+  const f2=useRef(new Animated.Value(0)).current
+  const f3=useRef(new Animated.Value(0)).current
 
-function NoidaOrb({ 
-  level, 
-  color, 
-  pulseKey 
-}: { 
-  level: number
-  color: [number, number, number]
-  pulseKey: number
-}) {
-  const [isPulsing, setIsPulsing] = useState(false)
-  
-  useEffect(() => {
-    if (pulseKey > 0) {
-      setIsPulsing(true)
-      const t = setTimeout(() => setIsPulsing(false), 1200)
-      return () => clearTimeout(t)
-    }
-  }, [pulseKey])
-  
-  const rgbColor = `rgb(${Math.round(color[0] * 255)}, ${Math.round(color[1] * 255)}, ${Math.round(color[2] * 255)})`
-  const size = 80 + level * 40
-  const glow = 20 + level * 80
-  const opacity = 0.3 + level * 0.7
-  
-  return (
-    <div className="absolute top-12 left-1/2 -translate-x-1/2 z-0 pointer-events-none">
-      <div
-        className={`rounded-full transition-all duration-[1200ms] ease-out ${isPulsing ? 'animate-noida-pulse' : ''}`}
-        style={{
-          width: `${size}px`,
-          height: `${size}px`,
-          background: `radial-gradient(circle at 40% 40%, 
-            rgba(255, 255, 255, ${opacity * 0.9}) 0%, 
-            ${rgbColor} 30%, 
-            rgba(0, 0, 20, 0) 70%)`,
-          boxShadow: `0 0 ${glow}px ${rgbColor}, 0 0 ${glow * 2}px ${rgbColor}80`,
-          opacity: opacity,
+  useEffect(()=>{
+    Animated.stagger(500,[
+      Animated.timing(f1,{toValue:1,duration:1000,easing:Easing.out(Easing.cubic),useNativeDriver:true}),
+      Animated.timing(f2,{toValue:1,duration:1000,easing:Easing.out(Easing.cubic),useNativeDriver:true}),
+      Animated.timing(f3,{toValue:1,duration:1000,easing:Easing.out(Easing.cubic),useNativeDriver:true}),
+    ]).start()
+  },[])
+
+  return(
+    <View style={[WC.wrap,{paddingBottom:insetBottom+48}]}>
+      <Animated.Text style={[WC.title,{opacity:f1}]}>N O I D A</Animated.Text>
+      <Animated.Text style={[WC.sub,{opacity:f2}]}>
+        あなただけのAIを、{'\n'}これから迎えにいきます。
+      </Animated.Text>
+      <Animated.View style={[WC.btnWrap,{opacity:f3}]}>
+        <TouchableOpacity
+          style={WC.btn}
+          activeOpacity={0.7}
+          onPress={()=>{Haptics.selectionAsync();onStart()}}
+        >
+          <Text style={WC.btnText}>始める</Text>
+        </TouchableOpacity>
+      </Animated.View>
+    </View>
+  )
+}
+
+function ProfileView({
+  name,company,position,onChange,onBack,onNext,insetBottom,onTypingFocus,
+}:{
+  name:string;company?:string;position?:string
+  onChange:(p:{name:string;company?:string;position?:string})=>void
+  onBack:()=>void;onNext:()=>void;insetBottom:number
+  onTypingFocus:(focused:boolean)=>void
+}){
+  const canNext=name.trim().length>0
+  const companyRef=useRef<TextInput>(null)
+  const positionRef=useRef<TextInput>(null)
+
+  return(
+    <View style={{flex:1}}>
+      <ScrollView
+        style={{flex:1}}
+        contentContainerStyle={{
+          paddingHorizontal:32,
+          paddingTop:40,
+          paddingBottom:110,
         }}
-      />
-      <style jsx>{`
-        @keyframes noida-pulse {
-          0%, 100% { transform: scale(1); filter: brightness(1); }
-          25%      { transform: scale(1.15); filter: brightness(1.6); }
-          50%      { transform: scale(1); filter: brightness(1); }
-          75%      { transform: scale(1.15); filter: brightness(1.6); }
-        }
-        .animate-noida-pulse {
-          animation: noida-pulse 1.2s ease-in-out;
-        }
-      `}</style>
-    </div>
-  )
-}
-
-// ============================================
-// イントロ画面
-// ============================================
-
-function IntroScreen({ onNext }: { onNext: () => void }) {
-  return (
-    <div className="text-center">
-      <h1 className="text-[28px] font-bold text-white mb-3">NOIDAへようこそ</h1>
-      <p className="text-[15px] text-white/60 mb-2">時間を、渡す。</p>
-      <p className="text-[13px] text-white/40 mb-10 leading-relaxed">
-        10の問いに答えるだけで<br />
-        あなた専用のNOIDAが誕生します
-      </p>
-      <button
-        onClick={onNext}
-        className="w-full bg-white text-[#0e0e16] rounded-2xl py-4 text-[15px] font-bold hover:bg-white/90 transition-colors"
+        keyboardShouldPersistTaps="handled"
       >
-        始める(約3〜5分)
-      </button>
-    </div>
-  )
-}
+        <Text style={PV.label}>P R O F I L E</Text>
+        <Text style={PV.question}>まず、あなたの{'\n'}情報を教えてください</Text>
 
-// ============================================
-// プロフィール画面
-// ============================================
+        <View style={TF.wrap}>
+          <Text style={TF.label}>お名前</Text>
+          <TextInput
+            style={TF.input}
+            value={name}
+            onChangeText={(v)=>onChange({name:v,company,position})}
+            autoFocus
+            returnKeyType="next"
+            onFocus={()=>onTypingFocus(true)}
+            onBlur={()=>onTypingFocus(false)}
+            onSubmitEditing={()=>companyRef.current?.focus()}
+            blurOnSubmit={false}
+          />
+        </View>
 
-function ProfileScreen({ 
-  profile, 
-  setProfile, 
-  onNext 
-}: { 
-  profile: { name: string; company: string; position: string }
-  setProfile: (p: any) => void
-  onNext: () => void
-}) {
-  return (
-    <div>
-      <p className="text-[11px] text-white/30 uppercase tracking-widest mb-3">基本情報</p>
-      <h2 className="text-[22px] font-bold text-white mb-8">あなたのことを教えてください</h2>
-      
-      <div className="space-y-4 mb-8">
-        <InputField
-          label="名前"
-          value={profile.name}
-          onChange={v => setProfile({ ...profile, name: v })}
-          placeholder="山田 太郎"
-        />
-        <InputField
-          label="会社名(任意)"
-          value={profile.company}
-          onChange={v => setProfile({ ...profile, company: v })}
-          placeholder="株式会社〇〇"
-        />
-        <InputField
-          label="役職(任意)"
-          value={profile.position}
-          onChange={v => setProfile({ ...profile, position: v })}
-          placeholder="代表取締役"
-        />
-      </div>
-      
-      <button
-        onClick={onNext}
-        disabled={!profile.name.trim()}
-        className="w-full bg-white text-[#0e0e16] rounded-2xl py-4 text-[14px] font-bold hover:bg-white/90 transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
-      >
-        次へ
-      </button>
-    </div>
-  )
-}
+        <View style={TF.wrap}>
+          <Text style={TF.label}>会社(任意)</Text>
+          <TextInput
+            ref={companyRef}
+            style={TF.input}
+            value={company??''}
+            onChangeText={(v)=>onChange({name,company:v,position})}
+            returnKeyType="next"
+            onFocus={()=>onTypingFocus(true)}
+            onBlur={()=>onTypingFocus(false)}
+            onSubmitEditing={()=>positionRef.current?.focus()}
+            blurOnSubmit={false}
+          />
+        </View>
 
-function InputField({ 
-  label, value, onChange, placeholder 
-}: { 
-  label: string; value: string; onChange: (v: string) => void; placeholder: string 
-}) {
-  return (
-    <div>
-      <label className="text-[11px] text-white/40 uppercase tracking-wider mb-2 block">{label}</label>
-      <input
-        value={value}
-        onChange={e => onChange(e.target.value)}
-        placeholder={placeholder}
-        className="w-full bg-white/5 border border-white/10 rounded-2xl px-4 py-3.5 text-[14px] text-white placeholder:text-white/20 outline-none focus:border-white/30 transition-colors"
-      />
-    </div>
-  )
-}
-
-// ============================================
-// 質問画面
-// ============================================
-
-function QuestionScreen({
-  question,
-  answer,
-  onSelectAnswer,
-  onTextAnswer,
-  onNext,
-  progress,
-}: {
-  question: Question
-  answer: string | undefined
-  onSelectAnswer: (v: string) => void
-  onTextAnswer: (v: string) => void
-  onNext: () => void
-  progress: number
-}) {
-  const canProceed = question.type === 'select' 
-    ? !!answer 
-    : !!answer && answer.trim().length >= question.minLength
-  
-  return (
-    <div>
-      {/* progress bar */}
-      <div className="flex gap-1 mb-8">
-        {Array.from({ length: 10 }).map((_, i) => (
-          <div
-            key={i}
-            className="h-1 flex-1 rounded-full transition-colors"
-            style={{ 
-              background: i < Math.floor(progress * 10) ? 'rgba(255,255,255,0.9)' : 'rgba(255,255,255,0.15)'
+        <View style={TF.wrap}>
+          <Text style={TF.label}>役職(任意)</Text>
+          <TextInput
+            ref={positionRef}
+            style={TF.input}
+            value={position??''}
+            onChangeText={(v)=>onChange({name,company,position:v})}
+            returnKeyType="done"
+            onFocus={()=>onTypingFocus(true)}
+            onBlur={()=>onTypingFocus(false)}
+            onSubmitEditing={()=>{
+              if(canNext){
+                Keyboard.dismiss()
+                setTimeout(onNext,100)
+              }
             }}
           />
-        ))}
-      </div>
-      
-      <p className="text-[11px] text-white/30 uppercase tracking-widest mb-3">
-        {question.label}
-      </p>
-      <h2 className="text-[19px] font-bold text-white mb-8 leading-relaxed">
-        {question.question}
-      </h2>
-      
-      {question.type === 'select' ? (
-        <div className="space-y-3 mb-6">
-          {question.options.map(opt => (
-            <button
-              key={opt.value}
-              onClick={() => onSelectAnswer(opt.value)}
-              className={`w-full text-left px-5 py-4 rounded-2xl border transition-all ${
-                answer === opt.value
-                  ? 'bg-white text-[#0e0e16] border-white'
-                  : 'bg-white/5 text-white/80 border-white/10 hover:bg-white/10 hover:border-white/20'
-              }`}
-            >
-              <span className="text-[13px] font-medium">{opt.label}</span>
-            </button>
-          ))}
-        </div>
-      ) : (
-        <div className="mb-6">
-          <textarea
-            value={answer || ''}
-            onChange={e => onTextAnswer(e.target.value)}
-            placeholder={question.placeholder}
-            rows={question.rows || 3}
-            className="w-full bg-white/5 border border-white/10 rounded-2xl px-4 py-3.5 text-[14px] text-white placeholder:text-white/20 outline-none focus:border-white/30 transition-colors resize-none"
-          />
-          {answer && answer.trim().length > 0 && answer.trim().length < question.minLength && (
-            <p className="text-[11px] text-white/40 mt-2">
-              もう少し詳しく教えてください(あと {question.minLength - answer.trim().length} 文字以上)
-            </p>
-          )}
-        </div>
-      )}
-      
-      {canProceed && (
-        <button
-          onClick={onNext}
-          className="w-full bg-white text-[#0e0e16] rounded-2xl py-4 text-[14px] font-bold hover:bg-white/90 transition-colors"
-        >
-          次へ
-        </button>
-      )}
-    </div>
-  )
-}
+        </View>
+      </ScrollView>
 
-// ============================================
-// MBTI 選択画面(Q11)
-// ============================================
-
-function MBTIScreen({
-  selected,
-  onSelect,
-  onStart,
-}: {
-  selected: string | 'unknown' | null
-  onSelect: (s: string | 'unknown') => void
-  onStart: () => void
-}) {
-  return (
-    <div>
-      <p className="text-[11px] text-white/30 uppercase tracking-widest mb-3">Q11(任意)</p>
-      <h2 className="text-[19px] font-bold text-white mb-2 leading-relaxed">
-        MBTIを知っていますか?
-      </h2>
-      <p className="text-[12px] text-white/40 mb-6">
-        分析精度が上がります
-      </p>
-      
-      <div className="grid grid-cols-4 gap-2 mb-4">
-        {MBTI_OPTIONS.map(opt => (
-          <button
-            key={opt.code}
-            onClick={() => onSelect(opt.code)}
-            className={`py-3 px-2 rounded-xl border transition-all ${
-              selected === opt.code
-                ? 'bg-white/10 border-2'
-                : 'bg-white/5 border border-white/10 hover:bg-white/10'
-            }`}
-            style={{
-              borderColor: selected === opt.code ? opt.hex : undefined,
-              boxShadow: selected === opt.code ? `0 0 20px ${opt.hex}80` : undefined,
-            }}
+      <KeyboardStickyView offset={{closed:0,opened:0}}>
+        <View style={[PV.btnRowAbs,{position:'relative',paddingBottom:Math.max(insetBottom,12)}]}>
+          <TouchableOpacity style={PV.btnBack} onPress={onBack} activeOpacity={0.6}>
+            <Text style={PV.btnBackText}>戻る</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={[PV.btnNext,!canNext&&PV.btnDisabled]}
+            disabled={!canNext}
+            onPress={()=>{Haptics.selectionAsync();Keyboard.dismiss();setTimeout(onNext,100)}}
+            activeOpacity={0.7}
           >
-            <div className="text-[12px] font-bold text-white">{opt.code}</div>
-            <div className="text-[10px] text-white/50 mt-0.5">{opt.name}</div>
-          </button>
-        ))}
-      </div>
-      
-      <div className="border-t border-white/10 my-5" />
-      
-      <button
-        onClick={() => onSelect('unknown')}
-        className={`w-full py-3 rounded-xl border transition-all ${
-          selected === 'unknown'
-            ? 'bg-white/10 border-white/40'
-            : 'bg-white/5 border-white/10 hover:bg-white/10'
-        }`}
-      >
-        <span className="text-[13px] text-white/70">知らない / 答えたくない</span>
-      </button>
-      
-      {selected && (
-        <button
-          onClick={onStart}
-          className="w-full bg-white text-[#0e0e16] rounded-2xl py-4 text-[14px] font-bold hover:bg-white/90 transition-colors mt-6"
-        >
-          分析を開始
-        </button>
-      )}
-    </div>
+            <Text style={PV.btnNextText}>次へ</Text>
+          </TouchableOpacity>
+        </View>
+      </KeyboardStickyView>
+    </View>
   )
 }
 
-// ============================================
-// 解析中画面(マジックモーメント)
-// ============================================
+function QuestionView({
+  q,value,progress,onAnswer,onNext,onBack,insetBottom,onTypingFocus,
+}:{
+  q:SelectQuestion|TextQuestion
+  value:string
+  progress:number
+  onAnswer:(v:string)=>void
+  onNext:()=>void
+  onBack:()=>void
+  insetBottom:number
+  onTypingFocus:(focused:boolean)=>void
+}){
+  const fade=useRef(new Animated.Value(0)).current
 
-function AnalyzingScreen({ name }: { name: string }) {
-  return (
-    <div className="text-center py-20">
-      <p className="text-[15px] text-white/60 mb-3">
-        あなただけのNOIDAを組み立てています
-      </p>
-      <p className="text-[12px] text-white/30">
-        少しだけ時間をください
-      </p>
-    </div>
-  )
-}
+  useEffect(()=>{
+    fade.setValue(0)
+    Animated.timing(fade,{
+      toValue:1,duration:400,
+      easing:Easing.out(Easing.cubic),
+      useNativeDriver:true,
+    }).start()
+  },[q.id])
 
-// ============================================
-// 完了画面
-// ============================================
+  const canNext=q.type==='text'?value.trim().length>=q.minLength:!!value
 
-function CompleteScreen({ 
-  name, 
-  result,
-  mbti,
-}: { 
-  name: string
-  result: any
-  mbti: string | null
-}) {
-  const mbtiOpt = mbti ? MBTI_OPTIONS.find(o => o.code === mbti) : null
-  
-  return (
-    <div className="text-center">
-      <p className="text-[13px] text-white/50 mb-3 tracking-widest uppercase">Analysis Complete</p>
-      <h2 className="text-[22px] font-bold text-white mb-2">
-        {name}さん専用の
-      </h2>
-      <h2 className="text-[22px] font-bold text-white mb-6">
-        NOIDAの核が完成しました
-      </h2>
-      
-      {result?.analysis?.summary && (
-        <div className="bg-white/5 border border-white/10 rounded-2xl p-5 mb-6">
-          <p className="text-[14px] text-white/90 leading-relaxed">
-            {result.analysis.summary}
-          </p>
-        </div>
-      )}
-      
-      <div className="space-y-2 mb-8 text-left">
-        {result?.analysis?.preset_id && (
-          <InfoRow label="判断タイプ" value={presetLabel(result.analysis.preset_id)} />
-        )}
-        {result?.analysis?.risk_stance && (
-          <InfoRow label="リスク姿勢" value={riskLabel(result.analysis.risk_stance)} />
-        )}
-        {result?.analysis?.value_driver && (
-          <InfoRow label="駆動価値" value={valueLabel(result.analysis.value_driver)} />
-        )}
-        {mbtiOpt && (
-          <InfoRow label="MBTI" value={`${mbtiOpt.code} ${mbtiOpt.name}`} color={mbtiOpt.hex} />
-        )}
-        {result?.analysis?.confidence != null && (
-          <InfoRow 
-            label="マッチング精度" 
-            value={`${Math.round(result.analysis.confidence * 100)}%`} 
-          />
-        )}
-      </div>
-      
-      <a
-        href="/"
-        className="block w-full bg-white text-[#0e0e16] rounded-2xl py-4 text-[14px] font-bold hover:bg-white/90 transition-colors"
-      >
-        NOIDAを始める
-      </a>
-    </div>
-  )
-}
+  if(q.type==='text'){
+    return(
+      <View style={{flex:1}}>
+        <Animated.View style={{flex:1,opacity:fade}}>
+          <View style={{paddingHorizontal:32,paddingTop:4}}>
+            <View style={QV.progressWrap}>
+              <View style={QV.progressTrack}>
+                <View style={[QV.progressFill,{width:`${progress}%`}]}/>
+              </View>
+              <Text style={QV.progressLabel}>{q.label}</Text>
+            </View>
+            <Text style={QV.question}>{q.question}</Text>
+          </View>
 
-function InfoRow({ label, value, color }: { label: string; value: string; color?: string }) {
-  return (
-    <div className="flex justify-between items-center py-2 border-b border-white/5">
-      <span className="text-[11px] text-white/40 uppercase tracking-wider">{label}</span>
-      <span 
-        className="text-[13px] font-medium"
-        style={{ color: color || 'rgba(255,255,255,0.9)' }}
-      >
-        {value}
-      </span>
-    </div>
-  )
-}
+          <View style={{marginTop:16,paddingHorizontal:32}}>
+            <TextInput
+              style={QV.textareaFlow}
+              value={value}
+              onChangeText={onAnswer}
+              placeholder={q.placeholder}
+              placeholderTextColor="rgba(255,255,255,0.22)"
+              multiline
+              autoFocus
+              textAlignVertical="top"
+              scrollEnabled={true}
+              onFocus={()=>onTypingFocus(true)}
+              onBlur={()=>onTypingFocus(false)}
+            />
+          </View>
+        </Animated.View>
 
-function presetLabel(id: string): string {
-  const m: Record<string, string> = {
-    decisive: '即断型',
-    verifier: '検証型',
-    optimizer: '最適化型',
-    intuitive: '直感型',
-    deliberator: '熟考型',
-    iterator: '反復型',
-    contrarian: '逆張り型',
-    relationship: '関係重視型',
+        <KeyboardStickyView offset={{closed:0,opened:0}}>
+          <View style={[QV.btnRowAbs,{position:'relative',paddingBottom:Math.max(insetBottom,12)}]}>
+            <TouchableOpacity style={QV.btnBack} onPress={onBack} activeOpacity={0.6}>
+              <Text style={QV.btnBackText}>戻る</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[QV.btnNext,!canNext&&QV.btnDisabled]}
+              disabled={!canNext}
+              onPress={()=>{Haptics.selectionAsync();onNext()}}
+              activeOpacity={0.7}
+            >
+              <Text style={QV.btnNextText}>次へ</Text>
+            </TouchableOpacity>
+          </View>
+        </KeyboardStickyView>
+      </View>
+    )
   }
-  return m[id] || id
-}
 
-function riskLabel(stance: string): string {
-  return ({ defensive: '守り', neutral: '中立', aggressive: '攻め' })[stance] || stance
-}
-
-function valueLabel(driver: string): string {
-  return ({
-    revenue: '売上', growth: '成長', freedom: '自由', aesthetic: '美学',
-    stability: '安定', advantage: '競争優位', recognition: '承認', influence: '影響力',
-  })[driver] || driver
-}
-
-// ============================================
-// エラー画面
-// ============================================
-
-function ErrorScreen({ message }: { message: string }) {
-  return (
-    <div className="text-center py-10">
-      <p className="text-[15px] text-white/80 mb-4">うまくいかなかった</p>
-      <p className="text-[12px] text-white/40 mb-6">{message}</p>
-      <button
-        onClick={() => window.location.reload()}
-        className="bg-white text-[#0e0e16] rounded-2xl px-8 py-3 text-[13px] font-bold hover:bg-white/90 transition-colors"
+  return(
+    <Animated.View style={{flex:1,opacity:fade}}>
+      <ScrollView
+        style={{flex:1}}
+        contentContainerStyle={{paddingHorizontal:32,paddingTop:4,paddingBottom:90}}
+        keyboardShouldPersistTaps="handled"
       >
-        やり直す
-      </button>
-    </div>
+        <View style={QV.progressWrap}>
+          <View style={QV.progressTrack}>
+            <View style={[QV.progressFill,{width:`${progress}%`}]}/>
+          </View>
+          <Text style={QV.progressLabel}>{q.label}</Text>
+        </View>
+
+        <Text style={QV.question}>{q.question}</Text>
+
+        <View style={{marginTop:16}}>
+          {q.options.map(opt=>{
+            const selected=value===opt.value
+            return(
+              <TouchableOpacity
+                key={opt.value}
+                style={[QV.option,selected&&QV.optionSelected]}
+                onPress={()=>{Haptics.selectionAsync();onAnswer(opt.value)}}
+                activeOpacity={0.6}
+              >
+                <View style={[QV.dot,selected&&QV.dotSelected]}/>
+                <Text style={[QV.optionText,selected&&QV.optionTextSelected]}>
+                  {opt.label}
+                </Text>
+              </TouchableOpacity>
+            )
+          })}
+        </View>
+      </ScrollView>
+
+      <View style={[QV.btnRowAbs,{paddingBottom:Math.max(insetBottom,12)}]}>
+        <TouchableOpacity style={QV.btnBack} onPress={onBack} activeOpacity={0.6}>
+          <Text style={QV.btnBackText}>戻る</Text>
+        </TouchableOpacity>
+        <View style={{flex:2}}/>
+      </View>
+    </Animated.View>
   )
 }
+
+function MBTIView({
+  selected,onSelect,onBack,onSubmit,error,isSubmitting,insetBottom,
+}:{
+  selected:MBTICode|'unknown'|null
+  onSelect:(code:MBTICode|'unknown'|null)=>void
+  onBack:()=>void
+  onSubmit:()=>Promise<boolean>
+  error:string|null
+  isSubmitting:boolean
+  insetBottom:number
+}){
+  return(
+    <View style={{flex:1}}>
+      <ScrollView
+        style={{flex:1}}
+        contentContainerStyle={{paddingHorizontal:20,paddingTop:4,paddingBottom:90}}
+        keyboardShouldPersistTaps="handled"
+      >
+        <Text style={MV.label}>最後の質問</Text>
+        <Text style={MV.question}>
+          もし知っていれば、{'\n'}MBTIを教えてください
+        </Text>
+
+        <View style={MV.grid}>
+          {MBTI_OPTIONS.map(opt=>{
+            const isSel=selected===opt.code
+            return(
+              <TouchableOpacity
+                key={opt.code}
+                style={[
+                  MV.cell,
+                  {
+                    borderColor:isSel?opt.hex:`${opt.hex}33`,
+                    backgroundColor:isSel?`${opt.hex}40`:`${opt.hex}0F`,
+                  },
+                ]}
+                onPress={()=>{Haptics.selectionAsync();onSelect(opt.code)}}
+                activeOpacity={0.7}
+              >
+                <View style={[MV.cellDot,{backgroundColor:opt.hex}]}/>
+                <Text style={[MV.cellCode,isSel&&MV.cellCodeSelected]}>{opt.code}</Text>
+                <Text style={[MV.cellName,isSel&&MV.cellNameSelected]}>{opt.name}</Text>
+              </TouchableOpacity>
+            )
+          })}
+        </View>
+
+        <TouchableOpacity
+          style={[
+            MV.unknownBtn,
+            selected==='unknown'&&{
+              borderColor:MBTI_UNKNOWN_HEX,
+              backgroundColor:`${MBTI_UNKNOWN_HEX}20`,
+            },
+          ]}
+          onPress={()=>{Haptics.selectionAsync();onSelect('unknown')}}
+          activeOpacity={0.7}
+        >
+          <View style={[MV.cellDot,{backgroundColor:MBTI_UNKNOWN_HEX}]}/>
+          <Text style={MV.unknownText}>知らない / わからない</Text>
+        </TouchableOpacity>
+
+        {error&&<Text style={MV.error}>{error}</Text>}
+      </ScrollView>
+
+      <View style={[MV.btnRowAbs,{paddingBottom:Math.max(insetBottom,12)}]}>
+        <TouchableOpacity style={MV.btnBack} onPress={onBack} activeOpacity={0.6}>
+          <Text style={MV.btnBackText}>戻る</Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          style={[MV.btnNext,(!selected||isSubmitting)&&MV.btnDisabled]}
+          disabled={!selected||isSubmitting}
+          onPress={async()=>{
+            Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium)
+            await onSubmit()
+          }}
+          activeOpacity={0.7}
+        >
+          <Text style={MV.btnNextText}>{isSubmitting?'解析中…':'分析を開始'}</Text>
+        </TouchableOpacity>
+      </View>
+    </View>
+  )
+}
+
+function AnalyzingView({insetTop}:{insetTop:number}){
+  const fade=useRef(new Animated.Value(0)).current
+  const d1=useRef(new Animated.Value(0.3)).current
+  const d2=useRef(new Animated.Value(0.3)).current
+  const d3=useRef(new Animated.Value(0.3)).current
+
+  useEffect(()=>{
+    Animated.timing(fade,{toValue:1,duration:800,useNativeDriver:true}).start()
+    const animate=(v:Animated.Value,delay:number)=>{
+      Animated.loop(
+        Animated.sequence([
+          Animated.delay(delay),
+          Animated.timing(v,{toValue:1,duration:600,useNativeDriver:true}),
+          Animated.timing(v,{toValue:0.3,duration:600,useNativeDriver:true}),
+        ])
+      ).start()
+    }
+    animate(d1,0)
+    animate(d2,200)
+    animate(d3,400)
+  },[])
+
+  return(
+    <View style={{flex:1,paddingTop:insetTop+ORB_AREA_HEIGHT+40}}>
+      <Animated.View style={[AV.wrap,{opacity:fade}]}>
+        <Text style={AV.main}>あなたを{'\n'}読んでいます</Text>
+        <View style={AV.dots}>
+          <Animated.View style={[AV.dot,{opacity:d1}]}/>
+          <Animated.View style={[AV.dot,{opacity:d2}]}/>
+          <Animated.View style={[AV.dot,{opacity:d3}]}/>
+        </View>
+      </Animated.View>
+    </View>
+  )
+}
+
+function presetLabel(id:string):string{
+  const map:Record<string,string>={
+    decisive:'即断型',verifier:'検証型',optimizer:'最適化型',
+    intuitive:'直感型',deliberator:'熟考型',iterator:'反復型',
+    contrarian:'反骨型',relationship:'関係型',
+  }
+  return map[id]??id
+}
+function riskLabel(r:string):string{
+  return r==='defensive'?'慎重':r==='aggressive'?'攻撃':'中庸'
+}
+function valueLabel(v:string):string{
+  const map:Record<string,string>={
+    revenue:'収益',growth:'成長',freedom:'自由',aesthetic:'美意識',
+    stability:'安定',advantage:'優位',recognition:'承認',influence:'影響力',
+  }
+  return map[v]??v
+}
+
+function CompleteView({result,onStart,insetTop,insetBottom}:{result:AnalysisResult;onStart:()=>void;insetTop:number;insetBottom:number}){
+  const t1=useRef(new Animated.Value(0)).current
+  const t2=useRef(new Animated.Value(0)).current
+  const t3=useRef(new Animated.Value(0)).current
+  const t4=useRef(new Animated.Value(0)).current
+  const t5=useRef(new Animated.Value(0)).current
+  const t6=useRef(new Animated.Value(0)).current
+  const t7=useRef(new Animated.Value(0)).current
+  const confCount=useRef(new Animated.Value(0)).current
+  const[displayConf,setDisplayConf]=useState(0)
+
+  useEffect(()=>{
+    Animated.stagger(400,[
+      Animated.timing(t1,{toValue:1,duration:800,easing:Easing.out(Easing.cubic),useNativeDriver:true}),
+      Animated.timing(t2,{toValue:1,duration:800,easing:Easing.out(Easing.cubic),useNativeDriver:true}),
+      Animated.timing(t3,{toValue:1,duration:800,easing:Easing.out(Easing.cubic),useNativeDriver:true}),
+      Animated.timing(t4,{toValue:1,duration:800,easing:Easing.out(Easing.cubic),useNativeDriver:true}),
+      Animated.timing(t5,{toValue:1,duration:800,easing:Easing.out(Easing.cubic),useNativeDriver:true}),
+      Animated.timing(t6,{toValue:1,duration:800,easing:Easing.out(Easing.cubic),useNativeDriver:true}),
+      Animated.timing(confCount,{toValue:result.confidence*100,duration:1200,easing:Easing.out(Easing.cubic),useNativeDriver:false}),
+      Animated.timing(t7,{toValue:1,duration:800,easing:Easing.out(Easing.cubic),useNativeDriver:true}),
+    ]).start()
+    const listener=confCount.addListener(({value})=>setDisplayConf(Math.round(value)))
+    return()=>confCount.removeListener(listener)
+  },[])
+
+  return(
+    <ScrollView
+      style={{flex:1}}
+      contentContainerStyle={{paddingTop:insetTop+ORB_AREA_HEIGHT+24,paddingHorizontal:24,paddingBottom:insetBottom+32,alignItems:'center'}}
+    >
+      <Animated.Text style={[CV.title,{opacity:t1}]}>完成しました</Animated.Text>
+      <Animated.Text style={[CV.sub,{opacity:t2}]}>
+        あなただけのNOIDAが、{'\n'}いま生まれました
+      </Animated.Text>
+
+      <View style={CV.cardRow}>
+        <Animated.View style={[CV.card,{opacity:t3}]}>
+          <Text style={CV.cardLabel}>判断</Text>
+          <Text style={CV.cardValue}>{presetLabel(result.preset_id)}</Text>
+        </Animated.View>
+        <Animated.View style={[CV.card,{opacity:t4}]}>
+          <Text style={CV.cardLabel}>姿勢</Text>
+          <Text style={CV.cardValue}>{riskLabel(result.risk_stance)}</Text>
+        </Animated.View>
+        <Animated.View style={[CV.card,{opacity:t5}]}>
+          <Text style={CV.cardLabel}>価値</Text>
+          <Text style={CV.cardValue}>{valueLabel(result.value_driver)}</Text>
+        </Animated.View>
+      </View>
+
+      <Animated.View style={[CV.matchWrap,{opacity:t6}]}>
+        <Text style={CV.matchLabel}>マッチ精度</Text>
+        <Text style={CV.matchValue}>{displayConf}%</Text>
+      </Animated.View>
+
+      {result.summary&&(
+        <Animated.Text style={[CV.summary,{opacity:t6}]}>{result.summary}</Animated.Text>
+      )}
+
+      <Animated.View style={[CV.btnWrap,{opacity:t7}]}>
+        <TouchableOpacity
+          style={CV.btn}
+          onPress={()=>{Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);onStart()}}
+          activeOpacity={0.7}
+        >
+          <Text style={CV.btnText}>はじめる</Text>
+        </TouchableOpacity>
+      </Animated.View>
+    </ScrollView>
+  )
+}
+
+const WC=StyleSheet.create({
+  wrap:{flex:1,paddingHorizontal:32,alignItems:'center',justifyContent:'center',gap:32},
+  title:{fontSize:28,fontWeight:'200',color:'white',letterSpacing:10},
+  sub:{fontSize:15,color:'rgba(255,255,255,0.55)',textAlign:'center',lineHeight:26,letterSpacing:0.5},
+  btnWrap:{width:'100%',alignItems:'center'},
+  btn:{width:'80%',paddingVertical:16,borderRadius:14,backgroundColor:'rgba(255,255,255,0.08)',borderWidth:0.5,borderColor:'rgba(255,255,255,0.2)',alignItems:'center'},
+  btnText:{fontSize:13,color:'white',letterSpacing:2,fontWeight:'500'},
+})
+
+const PV=StyleSheet.create({
+  label:{fontSize:10,letterSpacing:6,color:'rgba(255,255,255,0.3)',marginBottom:12,marginTop:4},
+  question:{fontSize:20,color:'white',lineHeight:30,marginBottom:28,fontWeight:'300'},
+  btnRowAbs:{
+    position:'absolute',left:0,right:0,bottom:0,
+    flexDirection:'row',gap:12,
+    paddingHorizontal:32,paddingTop:12,
+    backgroundColor:'#060608',
+    borderTopWidth:0.5,borderTopColor:'rgba(255,255,255,0.05)',
+  },
+  btnBack:{flex:1,paddingVertical:14,alignItems:'center'},
+  btnBackText:{fontSize:12,color:'rgba(255,255,255,0.4)',letterSpacing:2},
+  btnNext:{flex:2,paddingVertical:14,borderRadius:14,backgroundColor:'rgba(255,255,255,0.08)',borderWidth:0.5,borderColor:'rgba(255,255,255,0.2)',alignItems:'center'},
+  btnNextText:{fontSize:13,color:'white',letterSpacing:2,fontWeight:'500'},
+  btnDisabled:{opacity:0.3},
+})
+
+const TF=StyleSheet.create({
+  wrap:{marginBottom:22},
+  label:{fontSize:10,letterSpacing:2,color:'rgba(255,255,255,0.4)',marginBottom:6},
+  input:{fontSize:16,color:'white',paddingVertical:8,borderBottomWidth:0.5,borderBottomColor:'rgba(255,255,255,0.25)'},
+})
+
+const QV=StyleSheet.create({
+  progressWrap:{marginBottom:16},
+  progressTrack:{width:'100%',height:1.5,backgroundColor:'rgba(255,255,255,0.08)',borderRadius:1,marginBottom:6,overflow:'hidden'},
+  progressFill:{height:'100%',backgroundColor:'rgba(255,255,255,0.65)',borderRadius:1},
+  progressLabel:{fontSize:10,letterSpacing:4,color:'rgba(255,255,255,0.3)'},
+  question:{fontSize:20,color:'white',lineHeight:30,fontWeight:'300'},
+  option:{flexDirection:'row',alignItems:'center',paddingVertical:13,paddingHorizontal:14,marginBottom:4,borderRadius:10,gap:14},
+  optionSelected:{backgroundColor:'rgba(255,255,255,0.06)'},
+  dot:{width:6,height:6,borderRadius:4,borderWidth:1,borderColor:'rgba(255,255,255,0.3)'},
+  dotSelected:{backgroundColor:'white',borderColor:'white'},
+  textareaFlow:{
+    height:26*3+24,
+    fontSize:17,color:'white',
+    paddingVertical:12,
+    lineHeight:26,fontWeight:'300',
+  },
+  optionText:{fontSize:15,color:'rgba(255,255,255,0.7)',flex:1,letterSpacing:0.3},
+  optionTextSelected:{color:'white'},
+  btnRowAbs:{
+    position:'absolute',left:0,right:0,bottom:0,
+    flexDirection:'row',gap:12,
+    paddingHorizontal:32,paddingTop:12,
+    backgroundColor:'#060608',
+    borderTopWidth:0.5,borderTopColor:'rgba(255,255,255,0.05)',
+  },
+  btnBack:{flex:1,paddingVertical:14,alignItems:'center'},
+  btnBackText:{fontSize:12,color:'rgba(255,255,255,0.4)',letterSpacing:2},
+  btnNext:{flex:2,paddingVertical:14,borderRadius:14,backgroundColor:'rgba(255,255,255,0.08)',borderWidth:0.5,borderColor:'rgba(255,255,255,0.2)',alignItems:'center'},
+  btnNextText:{fontSize:13,color:'white',letterSpacing:2,fontWeight:'500'},
+  btnDisabled:{opacity:0.3},
+})
+
+const MV=StyleSheet.create({
+  label:{fontSize:10,letterSpacing:6,color:'rgba(255,255,255,0.3)',marginBottom:10,paddingHorizontal:4},
+  question:{fontSize:18,color:'white',lineHeight:28,fontWeight:'300',marginBottom:20,paddingHorizontal:4},
+  grid:{flexDirection:'row',flexWrap:'wrap',gap:8,marginBottom:12},
+  cell:{
+    width:(SW-20*2-8*3)/4,aspectRatio:1.3,
+    borderRadius:10,borderWidth:0.8,
+    alignItems:'center',justifyContent:'center',
+    gap:3,
+    paddingVertical:6,
+  },
+  cellDot:{width:5,height:5,borderRadius:3,marginBottom:2},
+  cellCode:{fontSize:12,color:'rgba(255,255,255,0.7)',letterSpacing:1.5,fontWeight:'500'},
+  cellCodeSelected:{color:'white'},
+  cellName:{fontSize:9,color:'rgba(255,255,255,0.45)',letterSpacing:0.3,fontWeight:'300',marginTop:1},
+  cellNameSelected:{color:'rgba(255,255,255,0.85)'},
+  unknownBtn:{
+    marginTop:6,paddingVertical:12,borderRadius:10,
+    borderWidth:0.8,borderColor:`${MBTI_UNKNOWN_HEX}33`,
+    backgroundColor:`${MBTI_UNKNOWN_HEX}10`,
+    alignItems:'center',flexDirection:'row',justifyContent:'center',gap:10,
+  },
+  unknownText:{fontSize:12,color:'rgba(255,255,255,0.7)',letterSpacing:1.5},
+  error:{color:'rgba(255,120,120,0.8)',fontSize:12,marginTop:12,textAlign:'center'},
+  btnRowAbs:{
+    position:'absolute',left:0,right:0,bottom:0,
+    flexDirection:'row',gap:12,
+    paddingHorizontal:32,paddingTop:12,
+    backgroundColor:'#060608',
+    borderTopWidth:0.5,borderTopColor:'rgba(255,255,255,0.05)',
+  },
+  btnBack:{flex:1,paddingVertical:14,alignItems:'center'},
+  btnBackText:{fontSize:12,color:'rgba(255,255,255,0.4)',letterSpacing:2},
+  btnNext:{flex:2,paddingVertical:14,borderRadius:14,backgroundColor:'rgba(255,255,255,0.08)',borderWidth:0.5,borderColor:'rgba(255,255,255,0.2)',alignItems:'center'},
+  btnNextText:{fontSize:13,color:'white',letterSpacing:2,fontWeight:'500'},
+  btnDisabled:{opacity:0.3},
+})
+
+const AV=StyleSheet.create({
+  wrap:{flex:1,alignItems:'center',gap:28},
+  main:{fontSize:20,color:'rgba(255,255,255,0.75)',textAlign:'center',lineHeight:30,letterSpacing:1,fontWeight:'300'},
+  dots:{flexDirection:'row',gap:10},
+  dot:{width:6,height:6,borderRadius:4,backgroundColor:'rgba(255,255,255,0.7)'},
+})
+
+const CV=StyleSheet.create({
+  title:{fontSize:22,color:'white',fontWeight:'200',letterSpacing:6,marginBottom:10},
+  sub:{fontSize:13,color:'rgba(255,255,255,0.55)',textAlign:'center',lineHeight:22,marginBottom:24},
+  cardRow:{flexDirection:'row',gap:8,width:'100%',marginBottom:16},
+  card:{flex:1,aspectRatio:1.1,backgroundColor:'rgba(255,255,255,0.04)',borderWidth:0.5,borderColor:'rgba(255,255,255,0.1)',borderRadius:12,alignItems:'center',justifyContent:'center',gap:5},
+  cardLabel:{fontSize:9,letterSpacing:2,color:'rgba(255,255,255,0.35)'},
+  cardValue:{fontSize:15,color:'white',fontWeight:'400',letterSpacing:1},
+  matchWrap:{marginTop:4,alignItems:'center',gap:3,marginBottom:12},
+  matchLabel:{fontSize:9,letterSpacing:3,color:'rgba(255,255,255,0.35)'},
+  matchValue:{fontSize:28,color:'white',fontWeight:'200',letterSpacing:1},
+  summary:{fontSize:12,color:'rgba(255,255,255,0.6)',textAlign:'center',lineHeight:20,marginBottom:20,paddingHorizontal:8},
+  btnWrap:{width:'100%',alignItems:'center',marginTop:8},
+  btn:{width:'85%',paddingVertical:15,borderRadius:14,backgroundColor:'rgba(255,255,255,0.1)',borderWidth:0.5,borderColor:'rgba(255,255,255,0.25)',alignItems:'center'},
+  btnText:{fontSize:13,color:'white',letterSpacing:3,fontWeight:'500'},
+})

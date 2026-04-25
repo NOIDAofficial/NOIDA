@@ -13,7 +13,6 @@ import {
   type PersonMatchResult 
 } from '@/lib/analyzer/personMatcher'
 import { correctInput } from '@/lib/analyzer/inputCorrector'
-import { buildPersonaPrompt } from '@/lib/persona'
 
 /**
  * NOIDA route.ts v2.0.0 (Phase 1 Day 7 - Conversation FSM)
@@ -932,6 +931,9 @@ async function performPreLLMAnalysis(
       .replace(/\d{1,2}:\d{2}/g, '')
       .replace(/\d{1,2}月\d{1,2}日/g, '')
       .replace(/仮で|一旦|とりあえず|暫定/g, '')
+      // ★v2.1.8 Bug Q: 時間未定表現 + 付帯語を除去
+      .replace(/時間未定|時刻未定|時間(は)?まだ|時間(は)?決まって(いない|ない)|時間後で|あとで時間/g, '')
+      .replace(/あるんだけど|あるんですけど|あるんだが|あるけど|あるよ/g, '')
       .replace(/の予定|予定|入れて|追加して|追加|入れといて|記録して/g, '')
       .replace(/[のはに、。]/g, '')
       .trim()
@@ -945,26 +947,6 @@ async function performPreLLMAnalysis(
     signals.has_family_context ||
     signals.has_appointment_context ||
     (!!extractedTitle && !VAGUE_TOPICS.test(extractedTitle))
-  
-  // ★v2.1.7 DEBUG: extractedTitle の実体を徹底追跡
-  const codesOf = (s: string | null): string[] | null => {
-    if (!s) return null
-    const codes: string[] = []
-    for (let i = 0; i < s.length; i++) {
-      codes.push(s.charCodeAt(i).toString(16))
-    }
-    return codes
-  }
-  console.log('🐛 [v2.1.7 TITLE DEBUG]', {
-    raw_text: text,
-    raw_text_json: JSON.stringify(text),
-    raw_text_codes: codesOf(text)?.slice(0, 20),
-    extractedTitle,
-    extractedTitle_json: JSON.stringify(extractedTitle),
-    extractedTitle_codes: codesOf(extractedTitle),
-    vague_test: extractedTitle ? VAGUE_TOPICS.test(extractedTitle) : null,
-    hasExplicitTitle_calc: hasExplicitTitle,
-  })
   
   const shouldDetectConflict = isCalendarAdd && hasExplicitTitle
   
@@ -1031,49 +1013,6 @@ function shouldDebounceReport(
   RECENT_MUTATIONS.push({ target_id: targetId, target_table: targetTable, timestamp: nowMs })
   return !!recent
 }
-
-// ===========================
-// Persona System(初期人格 × 育成人格の合成)
-// ===========================
-function getFinalPersona(owner: any): string | null {
-  if (!owner) return null
-
-  const initial = owner.initial_persona_prompt as string | null
-  const adaptive = owner.adaptive_persona_prompt as string | null
-  const version = (owner.persona_version as number) || 0
-
-  // 初期人格がない(古いユーザー)→ 4 軸から on-the-fly 生成
-  let initialPrompt = initial
-  if (!initialPrompt) {
-    initialPrompt = buildPersonaPrompt({
-      preset_id: owner.preset_id,
-      risk_stance: owner.risk_stance,
-      time_horizon: owner.time_horizon,
-      value_driver: owner.value_driver,
-      mbti: owner.mbti,
-    })
-  }
-
-  // 育成がまだない/薄い → 初期のみ
-  if (!adaptive || version < 1) {
-    return initialPrompt
-  }
-
-  // 両方ある → 育成 80% + 初期 20%
-  return `
-# 現在のこの人に合わせて育った状態(主要指針・80%の重み)
-${adaptive}
-
----
-
-# 根底の初期人格(基準点・20%の重み)
-${initialPrompt}
-
-両者に矛盾がある場合、80:20 の比重で判断する。
-育成側を優先しつつ、初期人格が示す核は絶対に失わない。
-`.trim()
-}
-
 
 async function fetchOwnerMaster() {
   const { data, error } = await supabase.from('owner_master').select('*').limit(1).single()
@@ -2205,8 +2144,10 @@ function normalizeCalendarTitle(rawTitle: string): string {
     .replace(/\d{1,2}時半/g, '')
     .replace(/\d{1,2}時/g, '')
     .replace(/\d{1,2}:\d{2}/g, '')
+    // ★v2.1.8 Bug Q: 時間未定表現 + 付帯語を除去
+    .replace(/時間未定|時刻未定|時間(は)?まだ|時間(は)?決まって(いない|ない)|時間後で|あとで時間/g, '')
+    .replace(/あるんだけど|あるんですけど|あるんだが|あるけど|あるよ|ある/g, '')
     // ★v2.1.3 Bug P 修正: LLM が title に「半」だけ残した場合の除去
-    //   例:LLM が「14時半」を「14時」と「半」に分けて、"半打ち合わせ" と save してくる
     .replace(/^半/, '')
     // 助詞(時刻・日付が除去された後の「に」「の」「から」を除去)
     .replace(/^に/, '')
@@ -3948,15 +3889,6 @@ export async function POST(req: NextRequest) {
     modifyPending
   )
 
-  // ===========================
-  // Persona Injection(4軸 × MBTI = 12,288通り + 育成)
-  // ===========================
-  const personaPrompt = getFinalPersona(owner)
-  const finalSystemPrompt = personaPrompt
-    ? `${personaPrompt}\n\n---\n\n${systemPrompt}`
-    : systemPrompt
-
-
   const cleanMessages = messages
     .map((m: any) => ({
       role: m.role === 'noida' ? 'assistant' : m.role,
@@ -3976,7 +3908,7 @@ export async function POST(req: NextRequest) {
       temperature,
       max_tokens: 1000,
       response_format: { type: 'json_object' },
-      messages: [{ role: 'system', content: finalSystemPrompt }, ...cleanMessages],
+      messages: [{ role: 'system', content: systemPrompt }, ...cleanMessages],
     }),
   })
 
@@ -4019,7 +3951,7 @@ export async function POST(req: NextRequest) {
           max_tokens: 1000,
           response_format: { type: 'json_object' },
           messages: [
-            { role: 'system', content: finalSystemPrompt },
+            { role: 'system', content: systemPrompt },
             ...cleanMessages,
             { role: 'assistant', content: text },
             {
